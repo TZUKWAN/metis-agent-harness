@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Metis Agent</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-icon" id="brandIcon">M</div>
+      <div>
+        <div class="brand-name" id="brandName">Metis Agent</div>
+        <div class="brand-subtitle" id="brandSubtitle">Agent Harness</div>
+      </div>
+    </div>
+    <button class="new-chat" id="newChat">+ New Chat</button>
+    <div class="sessions" id="sessions"></div>
+    <div class="sidebar-footer">
+      <div id="workspaceLabel">.</div>
+      <div id="modelLabel">model</div>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-button" id="sidebarToggle" aria-label="Toggle sessions">Menu</button>
+      <span class="pill" id="profileLabel">small</span>
+      <span class="pill" id="statusLabel">Ready</span>
+    </header>
+    <section class="messages" id="messages">
+      <div class="empty">
+        <div class="empty-icon" id="emptyIcon">M</div>
+        <h1 id="emptyTitle">Metis Agent</h1>
+        <p id="emptyDescription">Domain-neutral agent harness</p>
+      </div>
+    </section>
+    <footer class="composer">
+      <textarea id="messageInput" rows="1" placeholder="Send a task to the agent..."></textarea>
+      <button id="sendButton" disabled aria-label="Send message">Send</button>
+    </footer>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

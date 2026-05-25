@@ -1,0 +1,26 @@
+# Module Specification
+
+- `runtime`: agent loop, profiles, budgets, execution controller, strict output, trace metadata for task-contract and prompt-stack hashes.
+- `tools`: specs, registry, dispatcher, routing, guardrails, result persistence, permission-level metadata, and permission pre-dispatch enforcement.
+- `state`: SQLite persistence for sessions, messages, tool calls, plans, loops, schedules, and run checkpoints.
+- `adapters.cli`: command surface includes `metis checkpoint list/latest` for persisted checkpoint inspection and `metis resume` for same-session continuation.
+- `quality`: gate definitions and runner.
+- `swarm`: role templates, decomposition, bus, orchestrator, auditor, synthesizer.
+- `evidence.extractor`: converts typed tool results into ledger-ready evidence.
+- `evidence.matcher`: maps high-risk completion claims to required supporting evidence and returns claim verification tables.
+- `telemetry`: records and exports JSONL trajectories through HookBus integration.
+- `loops.scheduler`: parses schedules and persists loop schedules.
+- `planning.task_contract`: legacy step-scoped prompt contract plus `TaskContractV1` for runtime intake.
+- `prompts.assembler`: `PromptParts`, `PromptLayer`, `PromptStack`, and `PromptAssembler`.
+- `app.runtime`: manifest-driven runtime helpers that build `TaskContractV1`, `PromptStack`, runtime messages, runtime status, provider capability metadata, optional SQLite state backend, evidence ledger, and tool permission visibility for CLI/TUI/Web surfaces.
+- `develop.workflow`: developer customization package generation, including task contract artifacts.
+- `evals.gate`: release gate evaluation with `dev`, `candidate`, and `release` profiles.
+- `evals.compare` / `adapters.cli repair-execute`: verified repair-plan preflight, attempt recording, and optional no-shell execution of declared safe repair commands.
+- `package_lifecycle`: portable downstream agent package build, verification, installation, and zip export.
+- `providers.base`: `BaseProvider` and `ProviderCapabilities`, the normalized capability contract for provider feature discovery.
+- `providers.openai_compat`: OpenAI-compatible chat-completions provider with retry handling, native tool-call parsing, and capability reporting.
+- `providers.fake`: deterministic test provider with declared capabilities for harness and eval tests.
+- `adapters.cli`: command surface including `metis provider capabilities` for provider capability inspection.
+- `plugins.api`: `PluginManifest` and `PluginContext` for declared plugin identity, permissions, prompt/eval/evidence contributions, and runtime registration.
+- `plugins.manager`: plugin manifest loading, validation, and guarded plugin directory loading.
+- `adapters.cli`: command surface also includes `metis plugin inspect` for plugin manifest validation without executing plugin code.

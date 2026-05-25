@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metis-agent-harness"
+version = "0.1.0"
+description = "A domain-neutral agent harness runtime for controlled tool use, stateful execution, and small-model reliability."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+ui = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
+
+[project.scripts]
+metis = "metis.adapters.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["metis*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+norecursedirs = ["tests/fixtures"]
+markers = [
+    "unit: fast unit tests",
+    "integration: integration tests with fake or local dependencies",
+    "e2e: end-to-end tests",
+    "network: tests that require external network access",
+    "local_model: tests that require a configured local or remote model endpoint",
+]
