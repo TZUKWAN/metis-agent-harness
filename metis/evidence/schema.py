@@ -25,11 +25,11 @@ class EvidenceStrength(StrEnum):
 
 
 class CompletionClaim(StrEnum):
-    GENERATED = "已生成"
-    RAN = "已运行"
-    TESTED = "已测试"
-    UPLOADED = "已上传"
-    FIXED = "已修复"
+    GENERATED = "generated"
+    RAN = "ran"
+    TESTED = "tested"
+    UPLOADED = "uploaded"
+    FIXED = "fixed"
 
 
 SOURCE_TYPES = {item.value for item in EvidenceSourceType}

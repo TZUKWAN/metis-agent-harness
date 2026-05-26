@@ -20,7 +20,7 @@ def test_quality_gates_pass_for_real_artifact_and_evidence(tmp_path):
 
     result = QualityGateRunner().run(
         ["artifact_exists", "artifact_non_empty", "no_placeholder", "no_fake_completion"],
-        {"artifacts": [artifact], "evidence": [evidence], "final_text": "已生成报告"},
+        {"artifacts": [artifact], "evidence": [evidence], "final_text": "The report has been generated"},
     )
 
     assert result.passed is True

@@ -2,14 +2,26 @@ import pytest
 
 from metis.providers.fake import FakeProvider
 from metis.runtime.loop import AgentLoop
+from metis.runtime.profiles import ModelProfile
+from metis.runtime.budgets import BudgetConfig
 from metis.runtime.response import AgentRunRequest
 from metis.tools.registry import ToolRegistry
+
+HARD_SMALL = ModelProfile(
+    name="hard_small",
+    budget=BudgetConfig.for_profile("small"),
+    max_tools_per_turn=8,
+    max_tool_calls_per_turn=8,
+    one_tool_call_per_turn=True,
+    strict_output=True,
+    strict_output_soft=False,
+)
 
 
 @pytest.mark.asyncio
 async def test_agent_loop_blocks_when_strict_final_output_repair_fails():
     provider = FakeProvider([{"content": "done"}, {"content": "still not json"}])
-    loop = AgentLoop(provider=provider, registry=ToolRegistry(), profile="small")
+    loop = AgentLoop(provider=provider, registry=ToolRegistry(), profile=HARD_SMALL)
 
     result = await loop.run(AgentRunRequest(messages=[{"role": "user", "content": "finish"}], max_turns=1))
 

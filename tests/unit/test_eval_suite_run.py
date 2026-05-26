@@ -329,7 +329,7 @@ def test_generic_eval_tool_inventory_includes_builtin_tool_metadata(tmp_path):
     assert inventory["tool_count"] >= 5
     assert tool_by_name["read_file"]["category"] == "files"
     assert tool_by_name["write_file"]["side_effect"] == "write"
-    assert tool_by_name["run_shell"]["metadata"]["uses_shell"] is True
+    assert tool_by_name["run_shell"]["metadata"]["uses_shell"] is False
     assert "Metis Eval Tool Inventory" in markdown
     assert "read_file" in markdown
 

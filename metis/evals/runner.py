@@ -911,7 +911,8 @@ class EvalRunner:
         seen_results: set[tuple[str, str]] = set()
         duplicates = 0
         for result in run_result.tool_results:
-            key = (result.tool_name, result.content)
+            args_str = json.dumps(result.metadata.get("arguments", {}), sort_keys=True, ensure_ascii=False)
+            key = (result.tool_name, args_str)
             if key in seen_results:
                 duplicates += 1
             seen_results.add(key)

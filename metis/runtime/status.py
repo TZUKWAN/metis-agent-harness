@@ -12,6 +12,7 @@ class RuntimeStatus(StrEnum):
     NEEDS_MORE_WORK = "needs_more_work"
     MAX_TURNS = "max_turns"
     FAILED = "failed"
+    INTERRUPTED = "interrupted"
 
     @classmethod
     def from_strict_status(cls, status: str) -> "RuntimeStatus":
@@ -31,4 +32,6 @@ class RuntimeStatus(StrEnum):
             return "needs_more_work"
         if self == RuntimeStatus.BLOCKED:
             return "blocked"
+        if self == RuntimeStatus.INTERRUPTED:
+            return "interrupted"
         return "failed"

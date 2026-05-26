@@ -51,6 +51,7 @@ class ToolSpec:
     requires_permission: bool = False
     retry_policy: str = "default"
     verification: str | None = None
+    timeout_seconds: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def openai_schema(self) -> dict[str, Any]:

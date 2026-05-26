@@ -2,7 +2,7 @@ from metis.runtime.finalization import FinalizationGuard
 
 
 def test_finalization_guard_blocks_fake_test_claim():
-    result = FinalizationGuard().validate(final_text="已测试全部功能", tool_results=[])
+    result = FinalizationGuard().validate(final_text="All features have been tested", tool_results=[])
 
     assert result.passed is False
     assert result.status == "blocked"
@@ -10,7 +10,7 @@ def test_finalization_guard_blocks_fake_test_claim():
 
 def test_finalization_guard_allows_supported_test_claim():
     result = FinalizationGuard().validate(
-        final_text="已测试全部功能",
+        final_text="All features have been tested",
         tool_results=[{"tool_name": "run_shell", "content": "pytest: 3 passed"}],
     )
 

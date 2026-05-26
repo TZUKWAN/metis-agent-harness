@@ -90,7 +90,7 @@ async def test_small_model_report_task_reads_files_writes_artifact_and_passes_qu
             "artifacts": [artifact],
             "evidence": [evidence],
             "tool_results": result.tool_results,
-            "final_text": "已生成 architecture_report.md",
+            "final_text": "architecture_report.md has been generated",
         },
     )
 

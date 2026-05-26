@@ -15,7 +15,7 @@ async def test_agent_loop_finalization_guard_blocks_unsupported_completion_claim
     content = json.dumps(
         {
             "status": "done",
-            "summary": "已测试全部功能",
+            "summary": "All features have been tested",
             "evidence_refs": [],
             "artifact_refs": [],
             "next_action": "",
@@ -27,4 +27,4 @@ async def test_agent_loop_finalization_guard_blocks_unsupported_completion_claim
     result = await loop.run(AgentRunRequest(messages=[{"role": "user", "content": "finish"}], max_turns=1))
 
     assert result.status == "blocked"
-    assert any("已测试" in error for error in result.errors)
+    assert any("tested" in error for error in result.errors)

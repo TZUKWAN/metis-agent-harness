@@ -57,6 +57,7 @@ async def run_agent_turn(
     workspace: str | None = None,
     max_turns: int = 12,
     session_id: str = "default",
+    request_id: str = "",
 ) -> AgentRunResult:
     loop = build_agent_loop(manifest, workspace=workspace)
     task_contract = build_runtime_task_contract(message, manifest=manifest)
@@ -69,6 +70,7 @@ async def run_agent_turn(
             task_contract_hash=task_contract.contract_hash(),
             prompt_stack_hash=prompt_stack.stack_hash(),
             allowed_tool_permissions=manifest_allowed_tool_permissions(manifest),
+            request_id=request_id,
         )
     )
 

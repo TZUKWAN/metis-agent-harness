@@ -298,14 +298,12 @@ async def test_agent_loop_pre_dispatch_blocks_repeated_call_after_retry_budget_e
         AgentRunRequest(messages=[{"role": "user", "content": "run"}], allowed_tools=["fragile_tool"], max_turns=4)
     )
 
+    # Loop detection triggers on 3rd repeated tool call pattern before retry budget pre-dispatch block
     assert calls == 2
     assert result.tool_results[0].metadata["failure_type"] == "runtime_error"
     assert result.tool_results[1].metadata["retry_budget_exhausted"] is True
-    assert result.tool_results[2].metadata["failure_type"] == "retry_budget_exhausted"
-    assert result.tool_results[2].metadata["original_failure_type"] == "runtime_error"
-    third_feedback = json.loads(result.messages[6]["content"])
-    assert third_feedback["error_type"] == "retry_budget_exhausted"
-    assert third_feedback["retry_allowed"] is False
+    assert result.status == "blocked"
+    assert any("loop detected" in e.lower() for e in result.errors)
 
 
 @pytest.mark.asyncio

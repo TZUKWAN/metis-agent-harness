@@ -303,7 +303,7 @@ def _stable_unique(values: list[str]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
 
 
-COMPLETION_CLAIMS = ("已生成", "已运行", "已测试", "已上传", "已修复")
+COMPLETION_CLAIMS = ("generated", "ran", "tested", "uploaded", "fixed")
 
 
 def no_fake_completion_gate(context: dict[str, Any]) -> GateResult:
@@ -356,20 +356,20 @@ def _claim_has_evidence(claim: str, context: dict[str, Any]) -> bool:
     tool_text = " ".join(_tool_text(item) for item in tool_results).lower()
     tool_names = {_tool_name(item) for item in tool_results}
 
-    if claim == "已生成":
+    if claim == "generated":
         return bool(artifacts) or "artifact" in evidence_text or "write" in evidence_text
-    if claim == "已运行":
+    if claim == "ran":
         return bool(tool_results) or "command" in evidence_text or "run" in evidence_text
-    if claim == "已测试":
+    if claim == "tested":
         return (
             "run_shell" in tool_names
             and any(marker in tool_text for marker in ("pytest", "passed", "unittest", "test"))
-        ) or any(marker in evidence_text for marker in ("pytest", "passed", "test command", "测试通过"))
-    if claim == "已上传":
+        ) or any(marker in evidence_text for marker in ("pytest", "passed", "test command"))
+    if claim == "uploaded":
         return any(marker in evidence_text or marker in tool_text for marker in ("git", "github", "upload", "push"))
-    if claim == "已修复":
+    if claim == "fixed":
         return any(name in tool_names for name in ("write_file", "edit_file", "apply_patch")) or any(
-            marker in evidence_text for marker in ("fixed", "修复", "write", "patch")
+            marker in evidence_text for marker in ("fixed", "write", "patch")
         )
     return False
 

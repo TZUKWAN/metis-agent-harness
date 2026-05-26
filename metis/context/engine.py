@@ -28,14 +28,17 @@ class ContextEngine:
         budget: BudgetConfig | None = None,
         compressor: SimpleContextCompressor | None = None,
         chars_per_token: int = 4,
+        override_max_context_tokens: int | None = None,
     ) -> None:
         self.budget = budget or BudgetConfig.for_profile("small")
         self.compressor = compressor or SimpleContextCompressor()
         self.chars_per_token = chars_per_token
+        self.override_max_context_tokens = override_max_context_tokens
 
     @property
     def max_chars(self) -> int:
-        return int(self.budget.model_context_tokens * self.chars_per_token * self.budget.context_threshold)
+        tokens = self.override_max_context_tokens or self.budget.model_context_tokens
+        return int(tokens * self.chars_per_token * self.budget.context_threshold)
 
     def build(self, messages: list[dict[str, Any]]) -> ContextBuildResult:
         original_chars = self._count_chars(messages)
@@ -61,4 +64,8 @@ class ContextEngine:
 
     @staticmethod
     def _count_chars(messages: list[dict[str, Any]]) -> int:
-        return sum(len(str(message.get("content", ""))) for message in messages)
+        total = 0
+        for message in messages:
+            total += len(str(message.get("content", "")))
+            total += len(str(message.get("reasoning_content", "")))
+        return total

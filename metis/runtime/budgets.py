@@ -17,11 +17,11 @@ class BudgetConfig:
     def for_profile(cls, profile: str) -> "BudgetConfig":
         if profile == "small":
             return cls(
-                per_tool_chars=6000,
-                per_turn_chars=24000,
-                preview_chars=1500,
-                model_context_tokens=32768,
-                context_threshold=0.55,
+                per_tool_chars=4000,
+                per_turn_chars=20000,
+                preview_chars=1200,
+                model_context_tokens=128000,
+                context_threshold=0.50,
             )
         if profile == "deep":
             return cls(

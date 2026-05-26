@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from metis.config import DEFAULT_MAX_TURNS
+
 
 @dataclass
 class ToolCall:
@@ -41,13 +43,14 @@ class NormalizedResponse:
 @dataclass
 class AgentRunRequest:
     messages: list[dict[str, Any]]
-    max_turns: int = 20
+    max_turns: int = DEFAULT_MAX_TURNS
     session_id: str = "default"
     allowed_tools: list[str] | None = None
     allowed_tool_permissions: list[str] | None = None
     task_contract_hash: str = ""
     prompt_stack_hash: str = ""
     resume_from_checkpoint: bool = False
+    request_id: str = ""
 
 
 @dataclass

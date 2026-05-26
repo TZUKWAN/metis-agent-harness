@@ -23,6 +23,6 @@ class OpenAINativeParser(ToolCallParser):
             else:
                 name = function.get("name", "")
                 arguments_raw = function.get("arguments", "{}")
-            arguments = json.loads(arguments_raw or "{}") if isinstance(arguments_raw, str) else dict(arguments_raw)
+            arguments = json.loads(arguments_raw or "{}") if isinstance(arguments_raw, str) else dict(arguments_raw or {})
             calls.append(ToolCall(name=name, arguments=arguments, id=call_id, raw=item))
         return calls

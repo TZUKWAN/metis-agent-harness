@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shlex
-from typing import Any
+import time
+from typing import Any, Protocol, runtime_checkable
 
 from metis.context.engine import ContextEngine
 from metis.evidence.extractor import ToolEvidenceExtractor
 from metis.evidence.resolver import EvidenceResolver
 from metis.events.event_types import EventType
 from metis.events.hooks import HookBus
+from metis.logging import get_logger
 from metis.providers.base import BaseProvider
 from metis.runtime.budgets import BudgetConfig
 from metis.runtime.errors import ParserError
 from metis.runtime.finalization import FinalizationGuard
 from metis.runtime.profiles import ModelProfile, get_model_profile
-from metis.runtime.response import AgentRunRequest, AgentRunResult, ToolCall, ToolResult
+from metis.runtime.response import AgentRunRequest, AgentRunResult, NormalizedResponse, ToolCall, ToolResult
 from metis.runtime.status import RuntimeStatus
 from metis.runtime.strict_output import StrictOutputParser
 from metis.tools.dispatcher import ToolDispatcher
@@ -29,9 +32,38 @@ from metis.tools.schema_feedback import schema_repair_feedback
 from metis.tools.spec import ToolContext
 from metis.tools.tool_router import ToolRouteRequest, ToolRouter
 
+logger = get_logger("loop")
+
+
+@runtime_checkable
+class StateStore(Protocol):
+    def create_session(self, session_id: str, **kwargs: Any) -> str: ...
+    def append_message(self, session_id: str, role: str, content: str, **kwargs: Any) -> int: ...
+    def record_tool_call(self, session_id: str, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str: ...
+    def record_checkpoint(self, session_id: str, *, phase: str, status: str, **kwargs: Any) -> str: ...
+    def record_token_usage(self, session_id: str, **kwargs: Any) -> None: ...
+
+
+def _is_shutdown_requested() -> bool:
+    try:
+        from metis.runtime.shutdown import is_shutdown_requested
+        return is_shutdown_requested()
+    except ImportError:
+        return False
+
 
 class AgentLoop:
     """Execute model calls and tool calls until a final response or max_turns."""
+
+    _SESSION_TOOL_COUNTS: dict[str, dict[str, int]] = {}
+    _MAX_SAME_TOOL_PER_SESSION = 20
+    _SESSION_TOOL_FAILURES: dict[str, dict[str, list[float]]] = {}
+    _CIRCUIT_BREAKER_THRESHOLD = 3
+    _CIRCUIT_BREAKER_WINDOW = 300
+    _CIRCUIT_BREAKER_COOLDOWN = 60
+    _MAX_TRACKED_SESSIONS = 1000
+    _SESSION_ACTIVITY_TTL = 3600
+    _SESSION_LAST_ACTIVITY: dict[str, float] = {}
 
     def __init__(
         self,
@@ -41,7 +73,7 @@ class AgentLoop:
         dispatcher: ToolDispatcher | None = None,
         hooks: HookBus | None = None,
         workspace: str = ".",
-        state: Any = None,
+        state: StateStore | None = None,
         budget: BudgetConfig | None = None,
         profile: str | ModelProfile = "small",
         context_engine: ContextEngine | None = None,
@@ -66,7 +98,18 @@ class AgentLoop:
             self.result_store,
             ToolCallGuardrailController() if self.profile.name == "small" else None,
         )
-        self.context_engine = context_engine or ContextEngine(budget=self.budget)
+        try:
+            caps = provider.capabilities()
+            detected_tokens = caps.max_context_tokens
+            detected_max_output = caps.max_output_tokens
+        except Exception:
+            detected_tokens = 0
+            detected_max_output = 0
+        self.context_engine = context_engine or ContextEngine(
+            budget=self.budget,
+            override_max_context_tokens=detected_tokens if detected_tokens > 0 else None,
+        )
+        self.per_turn_timeout = self._compute_per_turn_timeout(detected_max_output)
         self.tool_router = tool_router or ToolRouter(registry)
         self.tool_call_parser = tool_call_parser or ParserChain()
         self.strict_output_parser = strict_output_parser or StrictOutputParser()
@@ -83,6 +126,7 @@ class AgentLoop:
         self.state = state
 
     async def run(self, request: AgentRunRequest) -> AgentRunResult:
+        logger.info("Agent run started session=%s max_turns=%d profile=%s", request.session_id, request.max_turns, self.profile.name)
         messages = list(request.messages)
         all_tool_results: list[ToolResult] = []
         usage_totals: dict[str, int] = {}
@@ -91,6 +135,14 @@ class AgentLoop:
         repair_failure_counts: dict[tuple[str, str], int] = {}
         exhausted_retry_fingerprints: dict[tuple[str, str], str] = {}
         exhausted_shape_fingerprints: dict[tuple[str, str, str], str] = {}
+        total_tool_calls = 0
+        tool_result_cache: dict[str, ToolResult] = {}
+        agent_memory: dict[str, str] = {}
+        turn_signatures: list[str] = []
+        AgentLoop._SESSION_TOOL_COUNTS.pop(request.session_id, None)
+        AgentLoop._SESSION_TOOL_FAILURES.pop(request.session_id, None)
+        AgentLoop._SESSION_LAST_ACTIVITY[request.session_id] = time.monotonic()
+        AgentLoop._prune_session_state()
 
         self._record_trace_event(
             trace_events,
@@ -104,6 +156,7 @@ class AgentLoop:
                 "prompt_stack_hash": request.prompt_stack_hash,
                 "allowed_tool_permissions": request.allowed_tool_permissions or [],
                 "resume_from_checkpoint": request.resume_from_checkpoint,
+                "request_id": request.request_id,
             },
         )
         self.hooks.emit(EventType.AGENT_PRE_RUN, {"session_id": request.session_id})
@@ -129,6 +182,27 @@ class AgentLoop:
 
         try:
             for turn_index in range(request.max_turns):
+                turn_start = time.monotonic()
+                if _is_shutdown_requested():
+                    logger.warning("Shutdown requested at turn %d, saving checkpoint", turn_index + 1)
+                    if self.state is not None:
+                        self._record_checkpoint(
+                            request.session_id, phase="agent.shutdown", status="interrupted",
+                            task_contract_hash=request.task_contract_hash,
+                            prompt_stack_hash=request.prompt_stack_hash,
+                            metadata={"turns_used": turn_index, "shutdown": True},
+                        )
+                    result = AgentRunResult(
+                        status="interrupted",
+                        final_text="Shutdown requested by user",
+                        messages=messages,
+                        turns_used=turn_index,
+                        tool_results=all_tool_results,
+                        usage=usage_totals,
+                        errors=errors,
+                        trace_events=trace_events,
+                    )
+                    return result
                 tool_schemas = self.tool_router.schemas(
                     ToolRouteRequest(stage="execute", allowed_tools=request.allowed_tools, profile=self.profile)
                 )
@@ -138,6 +212,13 @@ class AgentLoop:
                     {"session_id": request.session_id, "turn": turn_index + 1, "tool_count": len(tool_schemas)},
                 )
                 context_result = self.context_engine.build(messages)
+                provider_messages = self._ensure_reasoning_content(
+                    context_result.messages, getattr(self.provider, "model", "")
+                )
+                est_tokens = context_result.final_chars // max(1, self.context_engine.chars_per_token)
+                temperature = self._compute_temperature(
+                    turn_index, repair_failure_counts, turn_signatures
+                )
                 self._record_trace_event(
                     trace_events,
                     "model.request",
@@ -148,6 +229,12 @@ class AgentLoop:
                         "message_count": len(context_result.messages),
                         "tool_count": len(tool_schemas),
                         "compressed": context_result.compressed,
+                        "model": getattr(self.provider, "model", ""),
+                        "estimated_tokens": est_tokens,
+                        "max_chars_budget": context_result.max_chars,
+                        "compression_ratio": round(context_result.original_chars / max(1, context_result.final_chars), 2) if context_result.compressed else 1.0,
+                        "per_turn_timeout": self.per_turn_timeout,
+                        "temperature": temperature,
                         "gen_ai.operation.name": "chat",
                     },
                 )
@@ -162,7 +249,44 @@ class AgentLoop:
                             "max_chars": context_result.max_chars,
                         },
                     )
-                response = await self.provider.complete(context_result.messages, tools=tool_schemas)
+                try:
+                    response = await asyncio.wait_for(
+                        self.provider.complete(
+                            provider_messages, tools=tool_schemas, temperature=temperature
+                        ),
+                        timeout=self.per_turn_timeout,
+                    )
+                except Exception as exc:
+                    error_str = str(exc).lower()
+                    if "context" in error_str or "too long" in error_str or "length" in error_str:
+                        logger.warning("Turn %d context length error, truncating history", turn_index + 1)
+                        original_len = len(provider_messages)
+                        truncated = self._truncate_for_context(provider_messages)
+                        if len(truncated) < original_len:
+                            self._record_trace_event(
+                                trace_events, "context.truncated", request.session_id,
+                                turn=turn_index + 1, status="truncated",
+                                attributes={"original_messages": original_len, "truncated_messages": len(truncated)},
+                            )
+                            try:
+                                response = await asyncio.wait_for(
+                                    self.provider.complete(
+                                        truncated, tools=tool_schemas, temperature=temperature
+                                    ),
+                                    timeout=self.per_turn_timeout,
+                                )
+                            except Exception as retry_exc:
+                                errors.append(f"Turn {turn_index + 1} failed after truncation: {retry_exc}")
+                                continue
+                        else:
+                            errors.append(f"Turn {turn_index + 1} failed: {exc}")
+                            continue
+                    elif isinstance(exc, asyncio.TimeoutError):
+                        logger.warning("Turn %d timed out after %ds", turn_index + 1, self.per_turn_timeout)
+                        errors.append(f"Turn {turn_index + 1} timed out after {self.per_turn_timeout}s")
+                        continue
+                    else:
+                        raise
                 self._record_trace_event(
                     trace_events,
                     "model.response",
@@ -192,14 +316,71 @@ class AgentLoop:
                     {"session_id": request.session_id, "turn": turn_index + 1, "usage": response.usage},
                 )
                 self._merge_usage(usage_totals, response.usage)
+                turn_duration_ms = int((time.monotonic() - turn_start) * 1000)
+                self._record_trace_event(
+                    trace_events,
+                    "turn.timing",
+                    request.session_id,
+                    turn=turn_index + 1,
+                    status="ok",
+                    attributes={"turn_duration_ms": turn_duration_ms},
+                )
+                self.hooks.emit(
+                    "turn.complete",
+                    {
+                        "session_id": request.session_id,
+                        "turn": turn_index + 1,
+                        "turn_duration_ms": turn_duration_ms,
+                        "tool_call_count": len(response.tool_calls),
+                    },
+                )
+                if response.usage:
+                    self.hooks.emit(
+                        "model.token_usage",
+                        {
+                            "session_id": request.session_id,
+                            "turn": turn_index + 1,
+                            "turn_usage": response.usage,
+                            "cumulative_usage": dict(usage_totals),
+                        },
+                    )
 
-                if response.tool_calls and (
-                    len(response.tool_calls) > self.profile.max_tool_calls_per_turn
-                    or (self.profile.one_tool_call_per_turn and len(response.tool_calls) > 1)
-                ):
+                if response.tool_calls and self.profile.one_tool_call_per_turn and len(response.tool_calls) > 1:
+                    logger.debug("Truncating %d tool calls to 1 (one_tool_call_per_turn)", len(response.tool_calls))
+                    self._record_trace_event(
+                        trace_events, "tool.truncate", request.session_id,
+                        turn=turn_index + 1, status="truncated",
+                        attributes={"original_count": len(response.tool_calls), "kept": 1},
+                    )
+                    response.tool_calls = [response.tool_calls[0]]
+
+                turn_signatures.append(AgentLoop._turn_signature(response))
+                if AgentLoop._detect_response_loop(turn_signatures):
+                    loop_reason = f"Response loop detected: same pattern repeated for 3 consecutive turns"
+                    logger.warning(loop_reason)
+                    self._record_trace_event(
+                        trace_events, "agent.loop_detected", request.session_id,
+                        turn=turn_index + 1, status="blocked",
+                        attributes={"pattern": turn_signatures[-1]},
+                    )
+                    errors.append(loop_reason)
+                    result = AgentRunResult(
+                        status=RuntimeStatus.BLOCKED.value,
+                        final_text="",
+                        messages=messages,
+                        turns_used=turn_index + 1,
+                        tool_results=all_tool_results,
+                        usage=usage_totals,
+                        errors=errors,
+                        trace_events=trace_events,
+                    )
+                    self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
+                    return result
+
+                if response.tool_calls and len(response.tool_calls) > self.profile.max_tool_calls_per_turn:
                     reason = (
                         f"Tool call limit exceeded: got {len(response.tool_calls)}, "
-                        f"max={1 if self.profile.one_tool_call_per_turn else self.profile.max_tool_calls_per_turn}"
+                        f"max={self.profile.max_tool_calls_per_turn}"
                     )
                     result = AgentRunResult(
                         status=RuntimeStatus.BLOCKED.value,
@@ -223,6 +404,9 @@ class AgentLoop:
                     return result
 
                 assistant_message: dict[str, Any] = {"role": "assistant", "content": response.content or ""}
+                reasoning = getattr(response, "reasoning", None)
+                if reasoning:
+                    assistant_message["reasoning_content"] = reasoning
                 if response.tool_calls:
                     assistant_message["tool_calls"] = [
                         {
@@ -235,6 +419,9 @@ class AgentLoop:
                         }
                         for call in response.tool_calls
                     ]
+                    # Thinking-enabled APIs require reasoning_content on tool call messages
+                    if "reasoning_content" not in assistant_message:
+                        assistant_message["reasoning_content"] = reasoning or ""
                 messages.append(assistant_message)
                 if self.state is not None:
                     self.state.append_message(
@@ -248,211 +435,91 @@ class AgentLoop:
                     )
 
                 if not response.tool_calls:
-                    strict_status = RuntimeStatus.FINAL
-                    parsed_final = None
-                    if self.profile.strict_output and response.content:
-                        repaired_content = await self._repair_final_output(
-                            response.content,
-                            context_result.messages,
-                            tool_schemas,
-                            errors,
-                            trace_events,
-                            request.session_id,
-                            turn_index + 1,
-                        )
-                        if repaired_content is not None:
-                            response.content = repaired_content
-                        else:
-                            result = AgentRunResult(
-                                status="blocked",
-                                final_text=response.content or "",
-                                messages=messages,
-                                turns_used=turn_index + 1,
-                                tool_results=all_tool_results,
-                                usage=usage_totals,
-                                errors=errors,
-                                trace_events=trace_events,
-                            )
-                            self.hooks.emit(
-                                EventType.AGENT_POST_RUN,
-                                {"session_id": request.session_id, "status": result.status},
-                            )
-                            return result
-                        parsed_final = self.strict_output_parser.parse(response.content)
-                        strict_status = RuntimeStatus.from_strict_status(parsed_final.status)
-                        if strict_status != RuntimeStatus.FINAL:
-                            self._record_trace_event(
-                                trace_events,
-                                "finalization.result",
-                                request.session_id,
-                                turn=turn_index + 1,
-                                status=str(strict_status.value),
-                                attributes={"strict_status": parsed_final.status},
-                            )
-                            result = AgentRunResult(
-                                status=str(strict_status.value),
-                                final_text=response.content or "",
-                                messages=messages,
-                                turns_used=turn_index + 1,
-                                tool_results=all_tool_results,
-                                usage=usage_totals,
-                                errors=errors,
-                                trace_events=trace_events,
-                            )
-                            self.hooks.emit(
-                                EventType.AGENT_POST_RUN,
-                                {"session_id": request.session_id, "status": result.status},
-                            )
-                            return result
-                    self._record_trace_event(
-                        trace_events,
-                        "finalization.check",
-                        request.session_id,
-                        turn=turn_index + 1,
-                        status="started",
-                        attributes={
-                            "tool_results": len(all_tool_results),
-                            "strict_output": parsed_final is not None,
-                        },
-                    )
-                    finalization = self.finalization_guard.validate(
-                        final_text=response.content or "",
-                        artifacts=self.artifact_store.list_artifacts(request.session_id) if self.artifact_store else [],
-                        evidence=self.evidence_ledger.list_evidence(request.session_id) if self.evidence_ledger else [],
-                        tool_results=all_tool_results,
-                        strict_output=parsed_final,
-                    )
-                    final_errors = errors + finalization.errors
-                    self._record_trace_event(
-                        trace_events,
-                        "finalization.result",
-                        request.session_id,
-                        turn=turn_index + 1,
-                        status=finalization.status,
-                        attributes={
-                            "verified": finalization.verified,
-                            "error_count": len(finalization.errors),
-                        },
-                    )
-                    result = AgentRunResult(
-                        status=finalization.status,
-                        final_text=response.content or "",
-                        final_verified=finalization.verified,
+                    result = await self._finalize_turn(
+                        response=response,
+                        context_messages=context_result.messages,
+                        tool_schemas=tool_schemas,
                         messages=messages,
-                        turns_used=turn_index + 1,
-                        tool_results=all_tool_results,
-                        usage=usage_totals,
-                        errors=final_errors,
+                        all_tool_results=all_tool_results,
+                        usage_totals=usage_totals,
+                        errors=errors,
                         trace_events=trace_events,
-                    )
-                    self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
-                    self._record_checkpoint(
-                        request.session_id,
-                        phase="agent.finalization",
-                        status=result.status,
+                        session_id=request.session_id,
+                        turn_index=turn_index,
                         task_contract_hash=request.task_contract_hash,
                         prompt_stack_hash=request.prompt_stack_hash,
-                        metadata={"turns_used": result.turns_used, "error_count": len(result.errors)},
                     )
-                    return result
+                    if result is not None:
+                        return result
 
-                for call in response.tool_calls:
-                    self._record_trace_event(
-                        trace_events,
-                        "tool.request",
-                        request.session_id,
-                        turn=turn_index + 1,
-                        status="started",
-                        tool_name=call.name,
-                        tool_call_id=call.id,
-                        attributes={"arguments": call.arguments, "gen_ai.operation.name": "execute_tool"},
+                if self.profile.concurrent_tool_dispatch and len(response.tool_calls) > 1:
+                    total_tool_calls = await self._dispatch_tool_calls_batch(
+                        calls=response.tool_calls,
+                        session_id=request.session_id,
+                        turn_index=turn_index,
+                        messages=messages,
+                        all_tool_results=all_tool_results,
+                        errors=errors,
+                        trace_events=trace_events,
+                        repair_failure_counts=repair_failure_counts,
+                        exhausted_retry_fingerprints=exhausted_retry_fingerprints,
+                        exhausted_shape_fingerprints=exhausted_shape_fingerprints,
+                        allowed_tools=request.allowed_tools,
+                        allowed_tool_permissions=request.allowed_tool_permissions,
+                        tool_result_cache=tool_result_cache,
+                        total_tool_calls=total_tool_calls,
                     )
-                    tool_result = self._maybe_block_exhausted_tool_retry(
-                        call,
-                        exhausted_retry_fingerprints,
-                        exhausted_shape_fingerprints,
-                    )
-                    if tool_result is None:
-                        tool_result = self.dispatcher.dispatch(
-                            call,
-                            ToolContext(
-                                session_id=request.session_id,
-                                workspace=self.workspace,
-                                allowed_tools=request.allowed_tools,
-                                allowed_tool_permissions=request.allowed_tool_permissions,
-                                hooks=self.hooks,
-                                state=self.state,
-                            ),
+                    if total_tool_calls > self.profile.max_session_tool_calls:
+                        result = AgentRunResult(
+                            status=RuntimeStatus.BLOCKED.value,
+                            final_text="",
+                            messages=messages,
+                            turns_used=turn_index + 1,
+                            tool_results=all_tool_results,
+                            usage=usage_totals,
+                            errors=errors,
+                            trace_events=trace_events,
                         )
-                    self._apply_tool_failure_retry_budget(
-                        call,
-                        tool_result,
-                        repair_failure_counts,
-                        exhausted_retry_fingerprints,
-                        exhausted_shape_fingerprints,
-                    )
-                    tool_result_event = self._record_trace_event(
-                        trace_events,
-                        "tool.result",
-                        request.session_id,
-                        turn=turn_index + 1,
-                        status=tool_result.status,
-                        tool_name=tool_result.tool_name,
-                        tool_call_id=tool_result.tool_call_id,
-                        attributes={
-                            "failed": tool_result.failed,
-                            "metadata": tool_result.metadata,
-                            "error": tool_result.error,
-                            "gen_ai.operation.name": "execute_tool",
-                        },
-                    )
-                    self._record_schema_repair_hint_event(
-                        trace_events,
-                        request.session_id,
-                        turn=turn_index + 1,
-                        tool_result=tool_result,
-                        parent_event_id=str(tool_result_event.get("event_id", "")),
-                    )
-                    all_tool_results.append(tool_result)
-                    if self.state is not None:
-                        self.state.record_tool_call(
-                            request.session_id,
-                            call.name,
-                            call.arguments,
-                            result=tool_result.content,
-                            status=tool_result.status,
-                            error=tool_result.error,
-                            call_id=call.id or None,
-                        )
-                    if tool_result.failed:
-                        errors.append(tool_result.error or tool_result.content)
-                    if self.evidence_ledger is not None:
-                        evidence_refs: list[str] = []
-                        for extracted in self.evidence_extractor.extract(tool_result):
-                            record = self.evidence_ledger.record_claim(
-                                session_id=request.session_id,
-                                claim=extracted.claim,
-                                source_type=extracted.source_type,
-                                source_ref=extracted.source_ref,
-                                metadata=extracted.metadata,
+                        self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
+                        return result
+                else:
+                    for call in response.tool_calls:
+                        total_tool_calls += 1
+                        if total_tool_calls > self.profile.max_session_tool_calls:
+                            reason = f"Session tool call limit exceeded: {total_tool_calls} calls, max={self.profile.max_session_tool_calls}"
+                            logger.warning(reason)
+                            errors.append(reason)
+                            self._record_trace_event(
+                                trace_events, "tool.session_limit", request.session_id,
+                                turn=turn_index + 1, status="blocked",
+                                attributes={"total_tool_calls": total_tool_calls, "limit": self.profile.max_session_tool_calls},
                             )
-                            evidence_refs.append(record.id)
-                        if evidence_refs:
-                            tool_result.metadata["evidence_refs"] = evidence_refs
-                    tool_feedback = self._tool_feedback_content(tool_result)
-                    tool_message = {
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "name": call.name,
-                        "content": tool_feedback,
-                    }
-                    messages.append(tool_message)
-                    if self.state is not None:
-                        self.state.append_message(
-                            request.session_id,
-                            "tool",
-                            tool_feedback,
-                            {"tool": call.name, "tool_call_id": call.id},
+                            result = AgentRunResult(
+                                status=RuntimeStatus.BLOCKED.value,
+                                final_text="",
+                                messages=messages,
+                                turns_used=turn_index + 1,
+                                tool_results=all_tool_results,
+                                usage=usage_totals,
+                                errors=errors,
+                                trace_events=trace_events,
+                            )
+                            self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
+                            return result
+                        self._dispatch_tool_call(
+                            call=call,
+                            session_id=request.session_id,
+                            turn_index=turn_index,
+                            messages=messages,
+                            all_tool_results=all_tool_results,
+                            errors=errors,
+                            trace_events=trace_events,
+                            repair_failure_counts=repair_failure_counts,
+                            exhausted_retry_fingerprints=exhausted_retry_fingerprints,
+                            exhausted_shape_fingerprints=exhausted_shape_fingerprints,
+                            allowed_tools=request.allowed_tools,
+                            allowed_tool_permissions=request.allowed_tool_permissions,
+                            tool_result_cache=tool_result_cache,
                         )
 
             result = AgentRunResult(
@@ -468,15 +535,98 @@ class AgentLoop:
             self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
             return result
         except Exception as exc:
+            from metis.recovery.classifier import ErrorClassifier
+            error_category = ErrorClassifier().classify(exc)
             self._record_trace_event(
                 trace_events,
                 "agent.error",
                 request.session_id,
                 status="error",
-                attributes={"error": f"{type(exc).__name__}: {exc}"},
+                attributes={"error": f"{type(exc).__name__}: {exc}", "error_category": error_category},
             )
-            self.hooks.emit(EventType.AGENT_ERROR, {"session_id": request.session_id, "error": str(exc)})
+            self.hooks.emit(EventType.AGENT_ERROR, {"session_id": request.session_id, "error": str(exc), "category": error_category})
             raise
+        finally:
+            AgentLoop._cleanup_session_state(request.session_id)
+
+    @staticmethod
+    def _ensure_reasoning_content(
+        messages: list[dict[str, Any]], model: str = ""
+    ) -> list[dict[str, Any]]:
+        """Add empty reasoning_content to assistant tool call messages for thinking-enabled APIs."""
+        model_lower = model.lower()
+        thinking_models = ("glm-4.7", "glm-4.9", "glm-4.5", "claude")
+        if not any(prefix in model_lower for prefix in thinking_models):
+            return messages
+        result: list[dict[str, Any]] = []
+        for message in messages:
+            cloned = dict(message)
+            if cloned.get("role") == "assistant" and "tool_calls" in cloned:
+                if "reasoning_content" not in cloned:
+                    cloned["reasoning_content"] = ""
+            result.append(cloned)
+        return result
+
+    @staticmethod
+    def _cleanup_session_state(session_id: str) -> None:
+        """Remove session-specific state to prevent memory leaks."""
+        AgentLoop._SESSION_TOOL_COUNTS.pop(session_id, None)
+        AgentLoop._SESSION_TOOL_FAILURES.pop(session_id, None)
+        AgentLoop._SESSION_LAST_ACTIVITY.pop(session_id, None)
+
+    @staticmethod
+    def _prune_session_state() -> None:
+        """Evict stale or excess session entries from class-level caches."""
+        now = time.monotonic()
+        stale_threshold = now - AgentLoop._SESSION_ACTIVITY_TTL
+        stale_sessions = [
+            sid for sid, last_active in AgentLoop._SESSION_LAST_ACTIVITY.items()
+            if last_active < stale_threshold
+        ]
+        for sid in stale_sessions:
+            AgentLoop._cleanup_session_state(sid)
+
+        total_sessions = len(AgentLoop._SESSION_LAST_ACTIVITY)
+        if total_sessions > AgentLoop._MAX_TRACKED_SESSIONS:
+            sorted_sessions = sorted(
+                AgentLoop._SESSION_LAST_ACTIVITY.items(), key=lambda x: x[1]
+            )
+            to_evict = sorted_sessions[: total_sessions - AgentLoop._MAX_TRACKED_SESSIONS]
+            for sid, _ in to_evict:
+                AgentLoop._cleanup_session_state(sid)
+
+    @staticmethod
+    def _compute_temperature(
+        turn_index: int,
+        repair_failure_counts: dict[tuple[str, str], int],
+        turn_signatures: list[str],
+    ) -> float:
+        """Adjust temperature based on turn state to encourage response diversity.
+
+        Base 0.2, +0.05 per turn, +0.1 if repair failures exist,
+        +0.15 if loop risk detected (2 repeated signatures), clamped to [0.0, 0.8].
+        """
+        base = 0.2
+        turn_boost = min(turn_index * 0.05, 0.35)
+        repair_boost = 0.1 if any(c > 0 for c in repair_failure_counts.values()) else 0.0
+        loop_boost = 0.0
+        if len(turn_signatures) >= 2:
+            if turn_signatures[-1] == turn_signatures[-2]:
+                loop_boost = 0.15
+        temp = base + turn_boost + repair_boost + loop_boost
+        return round(max(0.0, min(0.8, temp)), 2)
+
+    @staticmethod
+    def _compute_per_turn_timeout(max_output_tokens: int) -> int:
+        """Scale timeout based on model's max output tokens.
+
+        Base 90s + 25s per 1K output tokens, clamped to [120, 600].
+        """
+        if max_output_tokens <= 0:
+            from metis.config import PER_TURN_TIMEOUT
+            return PER_TURN_TIMEOUT
+        calculated = 90 + (max_output_tokens // 1000) * 25
+        return max(120, min(600, calculated))
 
     @staticmethod
     def _merge_usage(target: dict[str, int], usage: dict[str, Any]) -> None:
@@ -578,10 +728,15 @@ class AgentLoop:
         failure_type = tool_result.metadata.get("failure_type")
         if not failure_type:
             evidence_refs = tool_result.metadata.get("evidence_refs")
+            content = tool_result.content
+            from metis.tools.summarizer import summarize_tool_result
+            summarized = summarize_tool_result(content, tool_result.tool_name)
+            if summarized != content:
+                content = summarized
             if isinstance(evidence_refs, list) and evidence_refs:
                 return json.dumps(
                     {
-                        "result": AgentLoop._json_or_text(tool_result.content),
+                        "result": AgentLoop._json_or_text(content),
                         "evidence_refs": evidence_refs,
                         "evidence_instruction": (
                             "Use these evidence_refs in the final JSON when making claims supported by this tool result."
@@ -589,7 +744,7 @@ class AgentLoop:
                     },
                     ensure_ascii=False,
                 )
-            return tool_result.content
+            return content
         feedback: dict[str, Any] = {
             "error_type": failure_type,
             "tool": tool_result.tool_name,
@@ -626,6 +781,26 @@ class AgentLoop:
         if "failure_shape_key" in tool_result.metadata:
             feedback["failure_shape_key"] = tool_result.metadata["failure_shape_key"]
         return json.dumps(feedback, ensure_ascii=False)
+
+    @staticmethod
+    def _compact_feedback(content: str, max_chars: int = 4000) -> str:
+        if len(content) <= max_chars:
+            return content
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict):
+                for key in ("error", "stderr"):
+                    if key in data and isinstance(data[key], str) and len(data[key]) > 500:
+                        data[key] = data[key][:500] + "... [truncated]"
+                for key in ("stdout", "result"):
+                    if key in data and isinstance(data[key], str) and len(data[key]) > 500:
+                        data[key] = data[key][:500] + "... [truncated]"
+                compacted = json.dumps(data, ensure_ascii=False)
+                if len(compacted) <= max_chars:
+                    return compacted
+            return content[:max_chars] + "\n... [truncated]"
+        except (json.JSONDecodeError, ValueError):
+            return content[:max_chars] + "\n... [truncated]"
 
     @staticmethod
     def _json_or_text(content: str) -> Any:
@@ -761,6 +936,15 @@ class AgentLoop:
         return " ".join(normalized[:2])
 
     @staticmethod
+    def _truncate_for_context(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Remove oldest non-system messages to reduce context length."""
+        system_messages = [m for m in messages if m.get("role") == "system"]
+        non_system = [m for m in messages if m.get("role") != "system"]
+        keep_count = max(4, len(non_system) // 2)
+        kept = non_system[-keep_count:] if len(non_system) > keep_count else non_system
+        return system_messages + kept
+
+    @staticmethod
     def _normalize_command_part(part: str) -> str:
         lowered = part.lower().strip()
         if lowered.startswith("-"):
@@ -888,3 +1072,388 @@ class AgentLoop:
                     attributes={"error": str(repair_exc)},
                 )
                 return None
+
+    async def _finalize_turn(
+        self,
+        *,
+        response: NormalizedResponse,
+        context_messages: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        all_tool_results: list[ToolResult],
+        usage_totals: dict[str, int],
+        errors: list[str],
+        trace_events: list[dict[str, Any]],
+        session_id: str,
+        turn_index: int,
+        task_contract_hash: str = "",
+        prompt_stack_hash: str = "",
+    ) -> AgentRunResult | None:
+        """Handle the no-tool-call case: strict output parsing and finalization."""
+        parsed_final = None
+        if self.profile.strict_output and response.content:
+            if self.profile.strict_output_soft:
+                parsed_final = self.strict_output_parser.parse_soft(response.content)
+                strict_status = RuntimeStatus.from_strict_status(parsed_final.status)
+                if strict_status != RuntimeStatus.FINAL:
+                    self._record_trace_event(
+                        trace_events, "finalization.result", session_id,
+                        turn=turn_index + 1, status=str(strict_status.value),
+                        attributes={"strict_status": parsed_final.status},
+                    )
+                    result = AgentRunResult(
+                        status=str(strict_status.value), final_text=response.content or "",
+                        messages=messages, turns_used=turn_index + 1,
+                        tool_results=all_tool_results, usage=usage_totals,
+                        errors=errors, trace_events=trace_events,
+                    )
+                    self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": session_id, "status": result.status})
+                    return result
+            else:
+                repaired_content = await self._repair_final_output(
+                    response.content, context_messages, tool_schemas,
+                    errors, trace_events, session_id, turn_index + 1,
+                )
+                if repaired_content is not None:
+                    response.content = repaired_content
+                else:
+                    result = AgentRunResult(
+                        status="blocked", final_text=response.content or "",
+                        messages=messages, turns_used=turn_index + 1,
+                        tool_results=all_tool_results, usage=usage_totals,
+                        errors=errors, trace_events=trace_events,
+                    )
+                    self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": session_id, "status": result.status})
+                    return result
+                parsed_final = self.strict_output_parser.parse(response.content)
+                strict_status = RuntimeStatus.from_strict_status(parsed_final.status)
+                if strict_status != RuntimeStatus.FINAL:
+                    self._record_trace_event(
+                        trace_events, "finalization.result", session_id,
+                        turn=turn_index + 1, status=str(strict_status.value),
+                        attributes={"strict_status": parsed_final.status},
+                    )
+                    result = AgentRunResult(
+                        status=str(strict_status.value), final_text=response.content or "",
+                        messages=messages, turns_used=turn_index + 1,
+                        tool_results=all_tool_results, usage=usage_totals,
+                        errors=errors, trace_events=trace_events,
+                    )
+                    self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": session_id, "status": result.status})
+                    return result
+        self._record_trace_event(
+            trace_events, "finalization.check", session_id,
+            turn=turn_index + 1, status="started",
+            attributes={"tool_results": len(all_tool_results), "strict_output": parsed_final is not None},
+        )
+        finalization = self.finalization_guard.validate(
+            final_text=response.content or "",
+            artifacts=self.artifact_store.list_artifacts(session_id) if self.artifact_store else [],
+            evidence=self.evidence_ledger.list_evidence(session_id) if self.evidence_ledger else [],
+            tool_results=all_tool_results,
+            strict_output=parsed_final,
+        )
+        final_errors = errors + finalization.errors
+        self._record_trace_event(
+            trace_events, "finalization.result", session_id,
+            turn=turn_index + 1, status=finalization.status,
+            attributes={"verified": finalization.verified, "error_count": len(finalization.errors)},
+        )
+        result = AgentRunResult(
+            status=finalization.status, final_text=response.content or "",
+            final_verified=finalization.verified, messages=messages,
+            turns_used=turn_index + 1, tool_results=all_tool_results,
+            usage=usage_totals, errors=final_errors, trace_events=trace_events,
+        )
+        self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": session_id, "status": result.status})
+        self._record_checkpoint(
+            session_id, phase="agent.finalization", status=result.status,
+            task_contract_hash=task_contract_hash, prompt_stack_hash=prompt_stack_hash,
+            metadata={"turns_used": result.turns_used, "error_count": len(result.errors)},
+        )
+        return result
+
+    def _dispatch_tool_call(
+        self,
+        *,
+        call: ToolCall,
+        session_id: str,
+        turn_index: int,
+        messages: list[dict[str, Any]],
+        all_tool_results: list[ToolResult],
+        errors: list[str],
+        trace_events: list[dict[str, Any]],
+        repair_failure_counts: dict[tuple[str, str], int],
+        exhausted_retry_fingerprints: dict[tuple[str, str], str],
+        exhausted_shape_fingerprints: dict[tuple[str, str, str], str],
+        allowed_tools: list[str] | None = None,
+        allowed_tool_permissions: list[str] | None = None,
+        tool_result_cache: dict[str, ToolResult] | None = None,
+    ) -> None:
+        """Dispatch one tool call and record results."""
+        cache_key = f"{call.name}:{json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)}"
+        if tool_result_cache is not None and cache_key in tool_result_cache:
+            cached = tool_result_cache[cache_key]
+            self._record_trace_event(
+                trace_events, "tool.cached", session_id,
+                turn=turn_index + 1, status="cached",
+                tool_name=call.name, tool_call_id=call.id,
+                attributes={"cache_key": cache_key},
+            )
+            cached_result = ToolResult(
+                call.name, cached.content, status=cached.status,
+                tool_call_id=call.id, error=cached.error,
+                metadata={**cached.metadata, "from_cache": True},
+            )
+            all_tool_results.append(cached_result)
+            if self.state is not None:
+                self.state.record_tool_call(
+                    session_id, call.name, call.arguments,
+                    result=cached.content, status=cached.status,
+                    error=cached.error, call_id=call.id or None,
+                )
+            tool_feedback = self._compact_feedback(self._tool_feedback_content(cached_result))
+            messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": tool_feedback})
+            return
+        session_counts = AgentLoop._SESSION_TOOL_COUNTS.setdefault(session_id, {})
+        session_counts[call.name] = session_counts.get(call.name, 0) + 1
+        if session_counts[call.name] > AgentLoop._MAX_SAME_TOOL_PER_SESSION:
+            error = f"Tool '{call.name}' rate limit exceeded: {session_counts[call.name]} calls, max={AgentLoop._MAX_SAME_TOOL_PER_SESSION} per session"
+            logger.warning(error)
+            tool_result = ToolResult(
+                call.name,
+                json.dumps({"error": error}, ensure_ascii=False),
+                status="blocked",
+                tool_call_id=call.id,
+                error=error,
+                metadata={"rate_limited": True, "tool_count": session_counts[call.name]},
+            )
+            self._record_trace_event(
+                trace_events, "tool.rate_limited", session_id,
+                turn=turn_index + 1, status="blocked",
+                tool_name=call.name, tool_call_id=call.id,
+                attributes={"tool_count": session_counts[call.name], "limit": AgentLoop._MAX_SAME_TOOL_PER_SESSION},
+            )
+            all_tool_results.append(tool_result)
+            errors.append(error)
+            messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": self._compact_feedback(self._tool_feedback_content(tool_result))})
+            if self.state is not None:
+                self.state.record_tool_call(
+                    session_id, call.name, call.arguments,
+                    result=tool_result.content, status=tool_result.status,
+                    error=tool_result.error, call_id=call.id or None,
+                )
+            return
+        cb_result = AgentLoop._check_circuit_breaker(session_id, call.name)
+        if cb_result is not None:
+            logger.warning(cb_result)
+            tool_result = ToolResult(
+                call.name,
+                json.dumps({"error": cb_result}, ensure_ascii=False),
+                status="blocked",
+                tool_call_id=call.id,
+                error=cb_result,
+                metadata={"circuit_breaker": True},
+            )
+            self._record_trace_event(
+                trace_events, "tool.circuit_breaker", session_id,
+                turn=turn_index + 1, status="blocked",
+                tool_name=call.name, tool_call_id=call.id,
+                attributes={"threshold": AgentLoop._CIRCUIT_BREAKER_THRESHOLD},
+            )
+            all_tool_results.append(tool_result)
+            errors.append(cb_result)
+            messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": self._compact_feedback(self._tool_feedback_content(tool_result))})
+            if self.state is not None:
+                self.state.record_tool_call(
+                    session_id, call.name, call.arguments,
+                    result=tool_result.content, status=tool_result.status,
+                    error=tool_result.error, call_id=call.id or None,
+                )
+            return
+        self._record_trace_event(
+            trace_events, "tool.request", session_id,
+            turn=turn_index + 1, status="started",
+            tool_name=call.name, tool_call_id=call.id,
+            attributes={"arguments": call.arguments, "gen_ai.operation.name": "execute_tool"},
+        )
+        tool_result = self._maybe_block_exhausted_tool_retry(
+            call, exhausted_retry_fingerprints, exhausted_shape_fingerprints,
+        )
+        if tool_result is None:
+            tool_result = self.dispatcher.dispatch(
+                call,
+                ToolContext(
+                    session_id=session_id, workspace=self.workspace,
+                    allowed_tools=allowed_tools,
+                    allowed_tool_permissions=allowed_tool_permissions,
+                    hooks=self.hooks, state=self.state,
+                ),
+            )
+        self._apply_tool_failure_retry_budget(
+            call, tool_result, repair_failure_counts,
+            exhausted_retry_fingerprints, exhausted_shape_fingerprints,
+        )
+        tool_result_event = self._record_trace_event(
+            trace_events, "tool.result", session_id,
+            turn=turn_index + 1, status=tool_result.status,
+            tool_name=tool_result.tool_name, tool_call_id=tool_result.tool_call_id,
+            attributes={
+                "failed": tool_result.failed, "metadata": tool_result.metadata,
+                "error": tool_result.error, "gen_ai.operation.name": "execute_tool",
+            },
+        )
+        self._record_schema_repair_hint_event(
+            trace_events, session_id, turn=turn_index + 1,
+            tool_result=tool_result,
+            parent_event_id=str(tool_result_event.get("event_id", "")),
+        )
+        all_tool_results.append(tool_result)
+        if tool_result_cache is not None and not tool_result.failed:
+            tool_result_cache[cache_key] = tool_result
+        if self.state is not None:
+            self.state.record_tool_call(
+                session_id, call.name, call.arguments,
+                result=tool_result.content, status=tool_result.status,
+                error=tool_result.error, call_id=call.id or None,
+            )
+        if tool_result.failed:
+            errors.append(tool_result.error or tool_result.content)
+            AgentLoop._record_tool_failure(session_id, call.name)
+        if self.evidence_ledger is not None:
+            evidence_refs: list[str] = []
+            for extracted in self.evidence_extractor.extract(tool_result):
+                record = self.evidence_ledger.record_claim(
+                    session_id=session_id, claim=extracted.claim,
+                    source_type=extracted.source_type, source_ref=extracted.source_ref,
+                    metadata=extracted.metadata,
+                )
+                evidence_refs.append(record.id)
+            if evidence_refs:
+                tool_result.metadata["evidence_refs"] = evidence_refs
+        tool_feedback = self._compact_feedback(self._tool_feedback_content(tool_result))
+        messages.append({
+            "role": "tool", "tool_call_id": call.id,
+            "name": call.name, "content": tool_feedback,
+        })
+        if self.state is not None:
+            self.state.append_message(
+                session_id, "tool", tool_feedback,
+                {"tool": call.name, "tool_call_id": call.id},
+            )
+
+    async def _dispatch_tool_calls_batch(
+        self,
+        *,
+        calls: list[ToolCall],
+        session_id: str,
+        turn_index: int,
+        messages: list[dict[str, Any]],
+        all_tool_results: list[ToolResult],
+        errors: list[str],
+        trace_events: list[dict[str, Any]],
+        repair_failure_counts: dict[tuple[str, str], int],
+        exhausted_retry_fingerprints: dict[tuple[str, str], str],
+        exhausted_shape_fingerprints: dict[tuple[str, str, str], str],
+        allowed_tools: list[str] | None = None,
+        allowed_tool_permissions: list[str] | None = None,
+        tool_result_cache: dict[str, ToolResult] | None = None,
+        total_tool_calls: int = 0,
+    ) -> int:
+        """Dispatch tool calls concurrently: read-only calls in parallel, then write calls sequentially."""
+        read_only_calls: list[ToolCall] = []
+        write_calls: list[ToolCall] = []
+
+        for call in calls:
+            spec = self.registry.get(call.name)
+            if spec is not None and spec.side_effect == "read":
+                read_only_calls.append(call)
+            else:
+                write_calls.append(call)
+
+        async def _dispatch_one(call: ToolCall) -> None:
+            nonlocal total_tool_calls
+            total_tool_calls += 1
+            if total_tool_calls > self.profile.max_session_tool_calls:
+                reason = f"Session tool call limit exceeded: {total_tool_calls} calls, max={self.profile.max_session_tool_calls}"
+                errors.append(reason)
+                self._record_trace_event(
+                    trace_events, "tool.session_limit", session_id,
+                    turn=turn_index + 1, status="blocked",
+                    attributes={"total_tool_calls": total_tool_calls, "limit": self.profile.max_session_tool_calls},
+                )
+                return
+            self._dispatch_tool_call(
+                call=call,
+                session_id=session_id,
+                turn_index=turn_index,
+                messages=messages,
+                all_tool_results=all_tool_results,
+                errors=errors,
+                trace_events=trace_events,
+                repair_failure_counts=repair_failure_counts,
+                exhausted_retry_fingerprints=exhausted_retry_fingerprints,
+                exhausted_shape_fingerprints=exhausted_shape_fingerprints,
+                allowed_tools=allowed_tools,
+                allowed_tool_permissions=allowed_tool_permissions,
+                tool_result_cache=tool_result_cache,
+            )
+
+        if read_only_calls:
+            self._record_trace_event(
+                trace_events, "tool.batch", session_id,
+                turn=turn_index + 1, status="started",
+                attributes={"concurrent_count": len(read_only_calls), "sequential_count": len(write_calls)},
+            )
+            await asyncio.gather(*[_dispatch_one(call) for call in read_only_calls])
+
+        for call in write_calls:
+            await _dispatch_one(call)
+
+        return total_tool_calls
+
+    @staticmethod
+    def _check_circuit_breaker(session_id: str, tool_name: str) -> str | None:
+        """Return error message if tool is circuit-broken, else None."""
+        now = time.monotonic()
+        failures = AgentLoop._SESSION_TOOL_FAILURES.get(session_id, {}).get(tool_name, [])
+        window_start = now - AgentLoop._CIRCUIT_BREAKER_WINDOW
+        recent = [t for t in failures if t >= window_start]
+        if len(recent) >= AgentLoop._CIRCUIT_BREAKER_THRESHOLD:
+            last_failure = max(recent)
+            if now - last_failure < AgentLoop._CIRCUIT_BREAKER_COOLDOWN:
+                return (
+                    f"Tool '{tool_name}' is temporarily unavailable due to repeated failures "
+                    f"({len(recent)} in the last {AgentLoop._CIRCUIT_BREAKER_WINDOW}s). "
+                    f"Try a different approach or return blocked."
+                )
+        return None
+
+    @staticmethod
+    def _record_tool_failure(session_id: str, tool_name: str) -> None:
+        """Record a tool failure for circuit breaker tracking."""
+        session_failures = AgentLoop._SESSION_TOOL_FAILURES.setdefault(session_id, {})
+        tool_failures = session_failures.setdefault(tool_name, [])
+        now = time.monotonic()
+        window_start = now - AgentLoop._CIRCUIT_BREAKER_WINDOW
+        tool_failures[:] = [t for t in tool_failures if t >= window_start]
+        tool_failures.append(now)
+
+    @staticmethod
+    def _turn_signature(response: NormalizedResponse) -> str:
+        """Generate a compact signature for loop detection."""
+        if response.tool_calls:
+            names = ",".join(sorted(call.name for call in response.tool_calls))
+            args_hashes = [
+                f"{call.name}:{json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)}"
+                for call in response.tool_calls
+            ]
+            return f"tools:{names}|args:{','.join(args_hashes)}"
+        return f"text:{response.content or ''}"
+
+    @staticmethod
+    def _detect_response_loop(signatures: list[str], threshold: int = 3) -> bool:
+        """Detect if the same response pattern has repeated threshold times."""
+        if len(signatures) < threshold:
+            return False
+        return len(set(signatures[-threshold:])) == 1

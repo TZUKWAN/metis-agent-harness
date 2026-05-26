@@ -13,7 +13,7 @@ from metis.tools.spec import ToolContext, ToolSpec
 class AuroraAdapter(Adapter):
     name = "aurora"
 
-    def __init__(self, project_root: str | Path = r"D:\LATEXTEST\aurora-agent") -> None:
+    def __init__(self, project_root: str | Path) -> None:
         self.project_root = Path(project_root).resolve()
 
     def register_tools(self, registry: ToolRegistry) -> list[ToolSpec]:

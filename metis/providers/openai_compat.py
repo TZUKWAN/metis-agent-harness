@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 from typing import Any
 
 import httpx
 
+from metis.config import DEFAULT_MODEL, DEFAULT_TEMPERATURE, MAX_TIMEOUT
+from metis.logging import get_logger
 from metis.providers.base import BaseProvider, ProviderCapabilities
 from metis.providers.parsers.openai_native import OpenAINativeParser
 from metis.providers.parsers.repair import ParserChain
+from metis.providers.response_cache import ResponseCache
 from metis.runtime.errors import ProviderError
 from metis.runtime.response import NormalizedResponse
+
+logger = get_logger("provider")
 
 
 class OpenAICompatibleProvider(BaseProvider):
@@ -28,8 +34,8 @@ class OpenAICompatibleProvider(BaseProvider):
     ) -> None:
         self.base_url = (base_url or os.getenv("METIS_BASE_URL", "")).rstrip("/")
         self.api_key = api_key or os.getenv("METIS_API_KEY", "")
-        self.model = model or os.getenv("METIS_MODEL", "glm-4.7-flash")
-        self.timeout = timeout
+        self.model = model or os.getenv("METIS_MODEL", DEFAULT_MODEL)
+        self.timeout = min(timeout, MAX_TIMEOUT)
         self.max_retries = max_retries if max_retries is not None else _env_int("METIS_PROVIDER_MAX_RETRIES", 3)
         self.retry_backoff_seconds = (
             retry_backoff_seconds
@@ -38,22 +44,78 @@ class OpenAICompatibleProvider(BaseProvider):
         )
         self.native_parser = OpenAINativeParser()
         self.text_parser = ParserChain()
+        self._client: httpx.AsyncClient | None = None
+        self._response_cache: ResponseCache | None = None
+        if _env_bool("METIS_PROVIDER_RESPONSE_CACHE", False):
+            max_size = _env_int("METIS_PROVIDER_CACHE_MAX_SIZE", 256)
+            ttl = _env_float("METIS_PROVIDER_CACHE_TTL_SECONDS", 300.0)
+            self._response_cache = ResponseCache(max_size=max_size, ttl_seconds=ttl)
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                timeout=self.timeout,
+                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            )
+        return self._client
+
+    async def close(self) -> None:
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
+
+    async def health_check(self) -> dict[str, Any]:
+        try:
+            client = self._get_client()
+            headers: dict[str, str] = {}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            resp = await client.get(f"{self.base_url}/models", headers=headers, timeout=10.0)
+            if resp.status_code == 200:
+                return {"status": "ok", "model": self.model, "endpoint": f"{self.base_url}/models"}
+            return {"status": "error", "error": f"HTTP {resp.status_code}", "model": self.model}
+        except Exception as exc:
+            return {"status": "error", "error": f"{type(exc).__name__}: {exc}", "model": self.model}
+
+    async def __aenter__(self) -> OpenAICompatibleProvider:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self.close()
+
+    _MODEL_CAPABILITIES: dict[str, dict[str, Any]] = {
+        "glm-4.9": {"thinking": True, "max_context_tokens": 256_000, "max_output_tokens": 16_384},
+        "glm-4.7": {"thinking": True, "max_context_tokens": 128_000, "max_output_tokens": 8_192},
+        "glm-4.5": {"thinking": True, "max_context_tokens": 128_000, "max_output_tokens": 8_192},
+        "glm-4": {"thinking": False, "max_context_tokens": 128_000, "max_output_tokens": 4_096},
+        "gpt-4o-mini": {"thinking": False, "max_context_tokens": 128_000, "max_output_tokens": 16_384},
+        "gpt-4o": {"thinking": False, "max_context_tokens": 128_000, "max_output_tokens": 16_384},
+        "gpt-4": {"thinking": False, "max_context_tokens": 128_000, "max_output_tokens": 8_192},
+        "claude-3-5-sonnet": {"thinking": False, "max_context_tokens": 200_000, "max_output_tokens": 8_192},
+        "claude-3-5-haiku": {"thinking": False, "max_context_tokens": 200_000, "max_output_tokens": 4_096},
+    }
 
     def capabilities(self) -> ProviderCapabilities:
         model_lower = self.model.lower()
+        detected = self._detect_model_capabilities(model_lower)
         return ProviderCapabilities(
             provider_type="openai_compatible",
             model=self.model,
             native_tool_calling=True,
-            json_schema_output=_env_bool("METIS_PROVIDER_JSON_SCHEMA_SUPPORTED", False),
-            streaming=False,
-            thinking=_env_bool(
-                "METIS_PROVIDER_THINKING_SUPPORTED",
-                "glm-4.7" in model_lower or "glm-4.5" in model_lower,
-            ),
-            max_context_tokens=_env_int("METIS_PROVIDER_MAX_CONTEXT_TOKENS", 0),
-            max_output_tokens=_env_int("METIS_PROVIDER_MAX_OUTPUT_TOKENS", 0),
+            json_schema_output=_env_bool("METIS_PROVIDER_JSON_SCHEMA_SUPPORTED", detected.get("json_schema_output", False)),
+            streaming=_env_bool("METIS_PROVIDER_STREAMING_SUPPORTED", detected.get("streaming", False)),
+            thinking=_env_bool("METIS_PROVIDER_THINKING_SUPPORTED", detected.get("thinking", False)),
+            max_context_tokens=_env_int("METIS_PROVIDER_MAX_CONTEXT_TOKENS", detected.get("max_context_tokens", 0)),
+            max_output_tokens=_env_int("METIS_PROVIDER_MAX_OUTPUT_TOKENS", detected.get("max_output_tokens", 0)),
         )
+
+    @classmethod
+    def _detect_model_capabilities(cls, model_lower: str) -> dict[str, Any]:
+        """Infer capabilities from known model name patterns."""
+        for prefix, caps in cls._MODEL_CAPABILITIES.items():
+            if prefix in model_lower:
+                return dict(caps)
+        return {}
 
     async def complete(
         self,
@@ -67,19 +129,37 @@ class OpenAICompatibleProvider(BaseProvider):
         payload: dict[str, Any] = {
             "model": params.pop("model", self.model),
             "messages": messages,
-            "temperature": params.pop("temperature", 0.2),
+            "temperature": params.pop("temperature", DEFAULT_TEMPERATURE),
         }
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = params.pop("tool_choice", "auto")
         payload.update(params)
 
+        env_max = os.getenv("METIS_PROVIDER_MAX_TOKENS")
+        if env_max:
+            payload["max_tokens"] = int(env_max)
+        elif "max_tokens" not in payload:
+            caps = self.capabilities()
+            if caps.max_output_tokens > 0:
+                payload["max_tokens"] = caps.max_output_tokens
+
         url = f"{self.base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            data = await self._post_with_retries(client, url, headers, payload)
+        if self._response_cache is not None:
+            cached = self._response_cache.get(messages, tools)
+            if cached is not None:
+                logger.debug("Cache hit for messages hash")
+                return self._parse_response(cached)
 
+        client = self._get_client()
+        data = await self._post_with_retries(client, url, headers, payload)
+        if self._response_cache is not None:
+            self._response_cache.put(messages, tools, data)
+        return self._parse_response(data)
+
+    def _parse_response(self, data: dict[str, Any]) -> NormalizedResponse:
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {})
         content = message.get("content") or ""
@@ -113,6 +193,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 return response.json()
             except Exception as exc:
                 last_error = exc
+                logger.warning("Provider attempt %d/%d failed: %s", attempt, attempts, exc)
                 if attempt >= attempts or not _is_retryable_provider_error(exc, response):
                     break
                 await asyncio.sleep(_retry_delay_seconds(response, attempt, self.retry_backoff_seconds))
@@ -135,7 +216,9 @@ def _retry_delay_seconds(response: httpx.Response | None, attempt: int, base_del
                 return max(0.0, min(float(retry_after), 30.0))
             except ValueError:
                 pass
-    return min(max(0.0, base_delay) * (2 ** (attempt - 1)), 30.0)
+    exponential = min(max(0.0, base_delay) * (2 ** (attempt - 1)), 30.0)
+    jitter = exponential * random.uniform(0.0, 0.25)
+    return min(exponential + jitter, 30.0)
 
 
 def _env_int(name: str, default: int) -> int:

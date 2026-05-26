@@ -18,7 +18,7 @@ async def test_agent_loop_records_extracted_command_evidence(tmp_path):
     registry = ToolRegistry()
     register_builtin_tools(registry, workspace=str(tmp_path))
     final = json.dumps(
-        {"status": "done", "summary": "已测试全部功能", "evidence_refs": [], "artifact_refs": [], "next_action": ""},
+        {"status": "done", "summary": "All features have been tested", "evidence_refs": [], "artifact_refs": [], "next_action": ""},
         ensure_ascii=False,
     )
     provider = FakeProvider(

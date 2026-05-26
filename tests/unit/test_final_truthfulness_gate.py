@@ -4,7 +4,7 @@ from metis.quality.runner import QualityGateRunner
 def test_final_truthfulness_gate_blocks_completion_claim_without_evidence():
     result = QualityGateRunner().run(
         ["no_fake_completion"],
-        {"final_text": "已生成并已测试全部功能", "artifacts": [], "evidence": [], "tool_results": []},
+        {"final_text": "Report has been generated and all features have been tested", "artifacts": [], "evidence": [], "tool_results": []},
     )
 
     assert result.passed is False
@@ -12,7 +12,7 @@ def test_final_truthfulness_gate_blocks_completion_claim_without_evidence():
 
 
 def test_final_truthfulness_gate_allows_plain_summary_without_claim():
-    result = QualityGateRunner().run(["no_fake_completion"], {"final_text": "下一步需要运行测试"})
+    result = QualityGateRunner().run(["no_fake_completion"], {"final_text": "Next step is to run the tests"})
 
     assert result.passed is True
 
@@ -21,7 +21,7 @@ def test_final_truthfulness_gate_rejects_test_claim_with_only_read_tool():
     result = QualityGateRunner().run(
         ["no_fake_completion"],
         {
-            "final_text": "已测试全部功能",
+            "final_text": "All features have been tested",
             "tool_results": [{"tool_name": "read_file", "content": "source"}],
             "artifacts": [],
             "evidence": [],
@@ -29,14 +29,14 @@ def test_final_truthfulness_gate_rejects_test_claim_with_only_read_tool():
     )
 
     assert result.passed is False
-    assert "已测试" in result.failed_results[0].message
+    assert "tested" in result.failed_results[0].message
 
 
 def test_final_truthfulness_gate_accepts_test_claim_with_pytest_command():
     result = QualityGateRunner().run(
         ["no_fake_completion"],
         {
-            "final_text": "已测试全部功能",
+            "final_text": "All features have been tested",
             "tool_results": [{"tool_name": "run_shell", "content": "pytest: 10 passed"}],
             "artifacts": [],
             "evidence": [],

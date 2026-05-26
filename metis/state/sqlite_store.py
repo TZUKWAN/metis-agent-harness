@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from pathlib import Path
 from typing import Any
@@ -15,13 +16,34 @@ class SQLiteStateStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn: sqlite3.Connection | None = None
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        if self._conn is not None:
+            try:
+                self._conn.execute("SELECT 1")
+                return self._conn
+            except sqlite3.Error:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        self._conn = conn
         return conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -139,10 +161,33 @@ class SQLiteStateStore:
                     metadata_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
+                CREATE TABLE IF NOT EXISTS token_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    model TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
                 """
             )
             self._ensure_column(conn, "steps", "required_gates_json", "TEXT NOT NULL DEFAULT '[]'")
             self._ensure_column(conn, "evidence", "strength", "TEXT NOT NULL DEFAULT 'medium'")
+            conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+                CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id);
+                CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
+                CREATE INDEX IF NOT EXISTS idx_evidence_session ON evidence(session_id);
+                CREATE INDEX IF NOT EXISTS idx_loops_session ON loops(session_id);
+                CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON run_checkpoints(session_id);
+                CREATE INDEX IF NOT EXISTS idx_goals_session ON goals(session_id);
+                CREATE INDEX IF NOT EXISTS idx_steps_plan ON steps(plan_id);
+                CREATE INDEX IF NOT EXISTS idx_schedules_loop ON schedules(loop_id);
+                CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
+                """
+            )
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -541,3 +586,31 @@ class SQLiteStateStore:
         data = dict(row)
         data["metadata"] = json.loads(data.pop("metadata_json"))
         return data
+
+    def record_token_usage(
+        self,
+        session_id: str,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        model: str = "",
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO token_usage (session_id, prompt_tokens, completion_tokens, total_tokens, model) VALUES (?, ?, ?, ?, ?)",
+                (session_id, prompt_tokens, completion_tokens, total_tokens, model),
+            )
+
+    def get_token_usage(self, session_id: str) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT SUM(prompt_tokens) as prompt, SUM(completion_tokens) as completion, SUM(total_tokens) as total, COUNT(*) as calls FROM token_usage WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+        return {
+            "prompt_tokens": int(row["prompt"] or 0),
+            "completion_tokens": int(row["completion"] or 0),
+            "total_tokens": int(row["total"] or 0),
+            "api_calls": int(row["calls"] or 0),
+        }

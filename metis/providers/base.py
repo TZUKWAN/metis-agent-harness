@@ -39,3 +39,13 @@ class BaseProvider(ABC):
         **params: Any,
     ) -> NormalizedResponse:
         """Return a normalized completion response."""
+
+    async def health_check(self) -> dict[str, Any]:
+        """Lightweight check that the provider endpoint is reachable."""
+        try:
+            response = await self.complete(
+                [{"role": "user", "content": "ping"}],
+            )
+            return {"status": "ok", "model": self.capabilities().model}
+        except Exception as exc:
+            return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}

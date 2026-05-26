@@ -33,7 +33,7 @@ async def test_fix_and_test_task_records_test_command_and_real_file_change(tmp_p
     result = await AgentLoop(provider=FakeProvider(responses), registry=registry, state=state, workspace=str(workspace)).run(
         AgentRunRequest(session_id=session_id, messages=[{"role": "user", "content": "Fix failing test"}], allowed_tools=["read_file", "write_file", "run_shell"], max_turns=6)
     )
-    quality = QualityGateRunner().run(["no_fake_completion"], {"final_text": "已修复并已测试", "tool_results": result.tool_results})
+    quality = QualityGateRunner().run(["no_fake_completion"], {"final_text": "The bug has been fixed and all tests have been tested", "tool_results": result.tool_results})
 
     assert "return a + b" in (workspace / "sample_project" / "calculator.py").read_text(encoding="utf-8")
     assert any(item.tool_name == "run_shell" for item in result.tool_results)

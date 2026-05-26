@@ -7,14 +7,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from metis.events.hooks import HookBus
+from metis.logging import get_logger
 from metis.swarm.bus import SwarmBus
 from metis.swarm.decomposer import AgentSpec, SwarmStage, TaskDecomposer
+
+logger = get_logger("swarm")
 
 
 @dataclass(frozen=True)
 class SwarmExecutionRecord:
     task: str
     results: list[dict[str, Any]] = field(default_factory=list)
+    errors: list[dict[str, Any]] = field(default_factory=list)
 
 
 class SwarmOrchestrator:
@@ -26,16 +30,31 @@ class SwarmOrchestrator:
 
     async def run(self, task_text: str) -> SwarmExecutionRecord:
         results: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
         for stage in self.decomposer.decompose(task_text):
             self.hooks.emit("swarm.stage_start", {"stage_id": stage.stage_id})
             if stage.parallel:
-                stage_results = await asyncio.gather(*(self._run_agent(agent, task_text) for agent in stage.agents))
+                stage_results = await asyncio.gather(
+                    *(self._run_agent(agent, task_text) for agent in stage.agents),
+                    return_exceptions=True,
+                )
+                for item in stage_results:
+                    if isinstance(item, BaseException):
+                        error_payload = {"error": str(item), "error_type": type(item).__name__}
+                        errors.append(error_payload)
+                        logger.warning("Agent failed in parallel stage: %s", item)
+                    else:
+                        results.append(item)
             else:
-                stage_results = []
                 for agent in stage.agents:
-                    stage_results.append(await self._run_agent(agent, task_text))
-            results.extend(stage_results)
-        return SwarmExecutionRecord(task_text, results)
+                    try:
+                        result = await self._run_agent(agent, task_text)
+                        results.append(result)
+                    except Exception as exc:
+                        error_payload = {"agent_id": agent.agent_id, "error": str(exc), "error_type": type(exc).__name__}
+                        errors.append(error_payload)
+                        logger.warning("Agent %s failed: %s", agent.agent_id, exc)
+        return SwarmExecutionRecord(task_text, results, errors)
 
     async def _run_agent(self, agent: AgentSpec, task_text: str) -> dict[str, Any]:
         self.bus.register_agent(agent.agent_id)

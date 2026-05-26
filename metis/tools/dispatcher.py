@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Any
 
+from metis.config import TOOL_EXECUTION_TIMEOUT
 from metis.events.event_types import EventType
 from metis.events.hooks import HookBus
 from metis.runtime.response import ToolCall, ToolResult
@@ -15,7 +18,12 @@ from metis.tools.registry import ToolRegistry
 from metis.tools.result_store import ToolResultStore
 from metis.tools.schema_feedback import schema_repair_feedback
 from metis.tools.schema_validator import ToolArgumentSchemaValidator
+from metis.tools.analytics import ToolAnalytics
+from metis.tools.coerce import coerce_arguments
+from metis.tools.sanitizer import ToolInputSanitizer
 from metis.tools.spec import ToolContext
+
+_executor = ThreadPoolExecutor(max_workers=4)
 
 
 class ToolDispatcher:
@@ -34,10 +42,19 @@ class ToolDispatcher:
         self.guardrails = guardrails
         self.policy_engine = policy_engine or ToolPolicyEngine()
         self.schema_validator = schema_validator or ToolArgumentSchemaValidator()
+        self.sanitizer = ToolInputSanitizer()
+        self.analytics = ToolAnalytics()
 
     def dispatch(self, call: ToolCall, context: ToolContext | None = None) -> ToolResult:
         context = context or ToolContext()
+        start = time.monotonic()
         context.hooks = context.hooks or self.hooks
+
+        call = ToolCall(
+            id=call.id,
+            name=call.name,
+            arguments=self.sanitizer.sanitize(call.arguments),
+        )
 
         spec = self.registry.get(call.name)
         if spec is None:
@@ -94,7 +111,10 @@ class ToolDispatcher:
                     metadata=tool_failure_metadata(ToolFailureType.GUARDRAIL_BLOCKED, retry_allowed=False),
                 )
 
-        schema_result = self.schema_validator.validate(spec.parameters, call.arguments)
+        coerced_args = coerce_arguments(spec.parameters, call.arguments)
+        schema_result = self.schema_validator.validate(spec.parameters, coerced_args)
+        if schema_result.passed and coerced_args != call.arguments:
+            call = ToolCall(id=call.id, name=call.name, arguments=coerced_args)
         if not schema_result.passed:
             error = "Tool argument schema validation failed: " + "; ".join(schema_result.errors)
             schema_feedback = schema_repair_feedback(schema_result.errors)
@@ -141,7 +161,20 @@ class ToolDispatcher:
             )
 
         try:
-            raw_result = spec.handler(call.arguments, context)
+            future = _executor.submit(spec.handler, call.arguments, context)
+            effective_timeout = spec.timeout_seconds or TOOL_EXECUTION_TIMEOUT
+            try:
+                raw_result = future.result(timeout=effective_timeout)
+            except FuturesTimeoutError:
+                error = f"Tool '{call.name}' timed out after {effective_timeout}s"
+                return ToolResult(
+                    call.name,
+                    self._json_error(error),
+                    status="error",
+                    tool_call_id=call.id,
+                    error=error,
+                    metadata=tool_failure_metadata(ToolFailureType.RUNTIME_ERROR, extra={"timeout": True}),
+                )
             content = raw_result if isinstance(raw_result, str) else json.dumps(raw_result, ensure_ascii=False)
             status = "ok"
             error_text = None
@@ -186,6 +219,8 @@ class ToolDispatcher:
                             "checksum": persisted.checksum,
                         },
                     )
+            metadata["dispatch_duration_ms"] = round((time.monotonic() - start) * 1000, 1)
+            metadata["result_size_bytes"] = len(content.encode("utf-8")) if content else 0
             result = ToolResult(call.name, content, status=status, tool_call_id=call.id, error=error_text, metadata=metadata)
             if self.guardrails is not None:
                 self.guardrails.after_call(call, spec, result)
@@ -193,9 +228,24 @@ class ToolDispatcher:
                 EventType.TOOL_POST_DISPATCH,
                 {"tool": call.name, "args": call.arguments, "result": content, "tool_call_id": call.id},
             )
+            self.hooks.emit(
+                "tool.analytics",
+                {
+                    "tool": call.name,
+                    "category": spec.category,
+                    "side_effect": spec.side_effect,
+                    "status": status,
+                    "duration_ms": metadata["dispatch_duration_ms"],
+                    "result_size_bytes": metadata["result_size_bytes"],
+                },
+            )
+            self.analytics.record(call.name, spec.category, metadata["dispatch_duration_ms"], status)
             return result
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
+            duration_ms = round((time.monotonic() - start) * 1000, 1)
+            category = spec.category if spec is not None else "unknown"
+            self.analytics.record(call.name, category, duration_ms, "error")
             result = ToolResult(
                 call.name,
                 self._json_error(error),

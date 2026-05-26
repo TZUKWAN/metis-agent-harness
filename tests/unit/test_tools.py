@@ -279,5 +279,5 @@ def test_builtin_read_file_blocks_unknown_argument_and_invalid_encoding(tmp_path
 
     assert result.status == "blocked"
     assert result.metadata["schema_valid"] is False
-    assert "$.encoding: value 'utf-16' not in enum ['utf-8', 'utf-8-sig']" in result.metadata["schema_errors"]
+    assert "$.encoding: value 'utf-16' not in enum ['auto', 'utf-8', 'utf-8-sig']" in result.metadata["schema_errors"]
     assert "$.url: additional property not allowed" in result.metadata["schema_errors"]

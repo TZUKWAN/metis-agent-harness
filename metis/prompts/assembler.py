@@ -8,12 +8,29 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from metis.planning.task_contract import TaskContractV1
-from metis.runtime.strict_output import STRICT_OUTPUT_INSTRUCTIONS
+from metis.runtime.strict_output import STRICT_OUTPUT_INSTRUCTIONS, STRICT_OUTPUT_INSTRUCTIONS_SOFT
 
 
 BASE_IDENTITY = (
     "You are Metis Executor, a domain-neutral agent runtime worker. "
     "Follow the current task contract and use tools only when needed."
+)
+
+SMALL_MODEL_IDENTITY = (
+    "You are Metis Executor. Complete the user's task step by step.\n"
+    "Rules:\n"
+    "- Use tools to read files, write files, run commands, or search code.\n"
+    "- Call one tool at a time. Wait for the result before proceeding.\n"
+    "- If a tool call fails, read the error message carefully. Fix the specific issue (wrong path, wrong argument name, missing file) and retry once.\n"
+    "- After all tool calls finish, write a short summary of what you did and what changed.\n"
+    "- Do NOT repeat the user's request back. Just execute and report.\n"
+    "- Do NOT ask for permission. Proceed with the best action.\n"
+    "- If the task is impossible with available tools, say so clearly.\n"
+    "- When reading a file, use read_file. For large files, use read_file_range with offset and limit.\n"
+    "- When searching, use search_code for patterns and find_files for filenames.\n"
+    "- When exploring a directory, use list_directory instead of running ls.\n"
+    "- Always check file contents with read_file before writing to avoid overwriting important data.\n"
+    "- For multi-step changes, plan the steps first, then execute one at a time."
 )
 
 
@@ -28,6 +45,7 @@ class PromptParts:
     recent_messages: list[dict[str, Any]] = field(default_factory=list)
     tool_policy: str = ""
     strict_output: bool = False
+    strict_output_soft: bool = False
     base_identity: str = BASE_IDENTITY
 
 
@@ -104,8 +122,9 @@ class PromptAssembler:
         app_developer_prompt: str = "",
         task_contract_v1: TaskContractV1 | None = None,
     ) -> PromptStack:
+        identity = SMALL_MODEL_IDENTITY if parts.strict_output_soft else parts.base_identity
         layers = [
-            PromptLayer("base-harness", parts.base_identity, "metis.prompts.assembler"),
+            PromptLayer("base-harness", identity, "metis.prompts.assembler"),
         ]
         if app_system_prompt:
             layers.append(PromptLayer("app-system", app_system_prompt, "metis.app.manifest.system_prompt_path"))
@@ -131,7 +150,7 @@ class PromptAssembler:
             PromptLayer("tool-policy", parts.tool_policy, "tools.policy"),
             PromptLayer(
                 "output-contract",
-                STRICT_OUTPUT_INSTRUCTIONS if parts.strict_output else "",
+                (STRICT_OUTPUT_INSTRUCTIONS_SOFT if parts.strict_output_soft else STRICT_OUTPUT_INSTRUCTIONS) if parts.strict_output else "",
                 "runtime.strict_output",
                 enabled=parts.strict_output,
             ),

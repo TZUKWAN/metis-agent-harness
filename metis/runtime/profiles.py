@@ -15,9 +15,12 @@ class ModelProfile:
     max_tool_calls_per_turn: int = 16
     one_tool_call_per_turn: bool = False
     strict_output: bool = False
+    strict_output_soft: bool = False
     require_done_evidence_refs: bool = False
     parser_repair_retries: int = 1
     max_tool_repair_retries: int = 2
+    max_session_tool_calls: int = 200
+    concurrent_tool_dispatch: bool = False
 
 
 PROFILES = {
@@ -28,8 +31,10 @@ PROFILES = {
         max_tool_calls_per_turn=8,
         one_tool_call_per_turn=True,
         strict_output=True,
+        strict_output_soft=True,
         parser_repair_retries=2,
         max_tool_repair_retries=1,
+        max_session_tool_calls=150,
     ),
     "balanced": ModelProfile(
         name="balanced",
@@ -59,6 +64,8 @@ PROFILES = {
         strict_output=False,
         parser_repair_retries=1,
         max_tool_repair_retries=4,
+        max_session_tool_calls=500,
+        concurrent_tool_dispatch=True,
     ),
 }
 
