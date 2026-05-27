@@ -80,28 +80,47 @@ from metis.evals.suite_validation import (
     validate_eval_suite,
     write_eval_suite_validation,
 )
-from metis.providers.openai_compat import OpenAICompatibleProvider
+from metis.providers.factory import build_provider
 from metis.package_lifecycle import build_package, export_package, install_package, verify_package
 from metis.plugins.manager import load_plugin_manifest, validate_plugin_manifest
 from metis.runtime.loop import AgentLoop
 from metis.runtime.response import AgentRunRequest
 from metis.state.sqlite_store import SQLiteStateStore
 from metis.telemetry.timeline import load_timeline, timeline_to_json, timeline_to_markdown
+from metis.mcp import MCPServer
 from metis.tools.builtin import register_builtin_tools
 from metis.tools.registry import ToolRegistry
 
 
+_RUN_EXAMPLES = """
+Examples:
+  metis run "Summarize this workspace"
+  metis run "Fix the bug" --model gpt-4o --api-key sk-...
+  metis run "Analyze data" --manifest ./my-agent.json --state-db ./state.db
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="metis")
+    parser.add_argument("--version", action="store_true", help="Print version and exit")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("doctor", help="Check runtime configuration")
-    run = sub.add_parser("run", help="Run a task through the Metis loop")
-    run.add_argument("task")
+    run = sub.add_parser(
+        "run",
+        help="Run a task through the Metis loop",
+        epilog=_RUN_EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    run.add_argument("task", help="Task instruction or question")
     run.add_argument("--workspace", default=".")
     run.add_argument("--max-turns", type=int, default=12)
-    run.add_argument("--manifest", help="Optional metis-agent.json app manifest")
-    run.add_argument("--state-db", help="Optional SQLite state database path")
-    run.add_argument("--session-id", default="default", help="Session id used when --state-db is enabled")
+    run.add_argument("--manifest", help="Optional metis-agent.json app manifest (default: auto-detect metis-agent.json in workspace)")
+    run.add_argument("--state-db", help="SQLite state database path (default: auto-create .metis/state.db)")
+    run.add_argument("--mcp", action="append", default=[], help="MCP server config JSON string (can be used multiple times)")
+    run.add_argument("--session-id", default="default", help="Session id for state persistence")
+    run.add_argument("--model", help="Override model name (default: manifest or METIS_MODEL env)")
+    run.add_argument("--api-key", help="Override API key (default: METIS_API_KEY env)")
+    run.add_argument("--base-url", help="Override provider base URL (default: manifest or METIS_BASE_URL env)")
     resume = sub.add_parser("resume", help="Resume a persisted Metis session from SQLite state")
     resume.add_argument("--state-db", required=True, help="SQLite state database path")
     resume.add_argument("--session-id", required=True, help="Session id to resume")
@@ -120,6 +139,10 @@ def build_parser() -> argparse.ArgumentParser:
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", type=int, default=8080)
     web.add_argument("--state-db", help="Optional SQLite state database path")
+    swarm = sub.add_parser("swarm", help="Start the Metis Swarm Hub — multi-agent management panel")
+    swarm.add_argument("--host", default="127.0.0.1")
+    swarm.add_argument("--port", type=int, default=8080)
+    swarm.add_argument("--scan", default=".", help="Directory to scan for agents on startup")
     develop = sub.add_parser("develop", help="Start the Metis developer adaptation workflow")
     develop.add_argument("--request", help="Downstream agent requirement. If omitted, interactive mode asks for it.")
     develop.add_argument("--name", help="Downstream agent display name. If omitted, interactive mode asks for it.")
@@ -141,6 +164,13 @@ def build_parser() -> argparse.ArgumentParser:
     trace_show.add_argument("--timeline", required=True, help="Timeline JSON path")
     trace_show.add_argument("--json", action="store_true", help="Print normalized JSON instead of markdown")
     trace_show.add_argument("--include-payload", action="store_true", help="Include full event payloads in markdown")
+    trace_show.add_argument("--html", action="store_true", help="Print HTML timeline")
+    trace_show.add_argument("--ascii", action="store_true", help="Print ASCII timeline")
+    trace_show.add_argument("--mermaid", action="store_true", help="Print Mermaid sequence diagram")
+    trace_report = trace_sub.add_parser("report", help="Generate an HTML report from a session result JSON")
+    trace_report.add_argument("--result", required=True, help="AgentRunResult JSON path")
+    trace_report.add_argument("--output", "-o", help="Write HTML to file instead of stdout")
+    trace_report.add_argument("--json", action="store_true", help="Print JSON report instead of HTML")
     eval_parser = sub.add_parser("eval", help="Run Metis evaluation suites")
     eval_sub = eval_parser.add_subparsers(dest="eval_suite")
     real_small = eval_sub.add_parser("real-small-model", help="Run the real small-model endpoint eval suite")
@@ -315,6 +345,11 @@ def build_parser() -> argparse.ArgumentParser:
     plugin_inspect = plugin_sub.add_parser("inspect", help="Validate and print a plugin manifest")
     plugin_inspect.add_argument("--path", required=True, help="Plugin directory or manifest.json path")
     plugin_inspect.add_argument("--json", action="store_true", help="Print JSON instead of text")
+    plugin_init = plugin_sub.add_parser("init", help="Scaffold a new plugin directory from template")
+    plugin_init.add_argument("--name", required=True, help="Plugin display name")
+    plugin_init.add_argument("--id", required=True, help="Plugin unique identifier")
+    plugin_init.add_argument("--output", default=".", help="Directory to create the plugin in")
+    plugin_init.add_argument("--type", choices=["tool", "gate", "prompt", "empty"], default="empty", help="Template type")
     checkpoint_parser = sub.add_parser("checkpoint", help="Inspect persisted run checkpoints")
     checkpoint_sub = checkpoint_parser.add_subparsers(dest="checkpoint_command")
     checkpoint_list = checkpoint_sub.add_parser("list", help="List checkpoints for a session")
@@ -325,19 +360,71 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint_latest.add_argument("--state-db", required=True, help="SQLite state database path")
     checkpoint_latest.add_argument("--session-id", required=True, help="Session id to inspect")
     checkpoint_latest.add_argument("--json", action="store_true", help="Print JSON instead of text")
+    mcp_server = sub.add_parser("mcp-server", help="Start an MCP stdio server exposing Metis tools")
+    mcp_server.add_argument("--manifest", help="Optional metis-agent.json app manifest")
+    mcp_server.add_argument("--workspace", default=".", help="Workspace used to build the active tool registry")
+    mcp_server.add_argument("--name", default="metis-mcp-server", help="MCP server name")
     return parser
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     print("Metis doctor")
-    print(f"METIS_BASE_URL={'set' if os.getenv('METIS_BASE_URL') else 'missing'}")
-    print(f"METIS_API_KEY={'set' if os.getenv('METIS_API_KEY') else 'missing'}")
-    print(f"METIS_MODEL={os.getenv('METIS_MODEL', 'glm-4.7-flash')}")
+    base_url = os.getenv("METIS_BASE_URL", "")
+    api_key = os.getenv("METIS_API_KEY", "")
+    model = os.getenv("METIS_MODEL", "")
+
+    issues: list[str] = []
+
+    if base_url:
+        print(f"  METIS_BASE_URL: {base_url}")
+    else:
+        print("  METIS_BASE_URL: missing")
+        issues.append("Set METIS_BASE_URL to your provider endpoint (e.g., https://api.openai.com/v1)")
+
+    if api_key:
+        masked = api_key[:4] + "..." + api_key[-4:] if len(api_key) > 8 else "***"
+        print(f"  METIS_API_KEY: {masked}")
+    else:
+        print("  METIS_API_KEY: missing")
+        issues.append("Set METIS_API_KEY to your provider API key")
+
+    print(f"  METIS_MODEL: {model or 'not set (will use manifest default)'}")
+
+    manifest_path = Path("metis-agent.json")
+    if manifest_path.exists():
+        print(f"  manifest: {manifest_path.resolve()}")
+        try:
+            import json as _json
+            data = _json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+            m_base = data.get("base_url", "")
+            m_model = data.get("model", "")
+            if m_base:
+                print(f"    base_url from manifest: {m_base}")
+            if m_model:
+                print(f"    model from manifest: {m_model}")
+        except Exception:
+            pass
+    else:
+        print("  manifest: metis-agent.json not found")
+        issues.append("Run 'metis app init --name \"My Agent\"' to create a manifest")
+
+    if issues:
+        print("\nIssues found:")
+        for issue in issues:
+            print(f"  - {issue}")
+        print("\nQuick start:")
+        print('  export METIS_BASE_URL="https://api.openai.com/v1"')
+        print('  export METIS_API_KEY="sk-..."')
+        print('  export METIS_MODEL="gpt-4o"')
+        print('  metis run "Hello world"')
+        return 1
+
+    print("\nConfiguration looks good.")
     return 0
 
 
 def _provider_capabilities(args: argparse.Namespace) -> int:
-    provider = OpenAICompatibleProvider(model=args.model, base_url=args.base_url)
+    provider = build_provider(model=args.model, base_url=args.base_url)
     capabilities = provider.capabilities().to_dict()
     if args.json:
         print(json.dumps(capabilities, ensure_ascii=False, indent=2, sort_keys=True))
@@ -349,6 +436,127 @@ def _provider_capabilities(args: argparse.Namespace) -> int:
                 value = ", ".join(str(item) for item in value)
             print(f"{key}: {value}")
     return 0
+
+
+def _plugin_init(args: argparse.Namespace) -> int:
+    output_dir = Path(args.output) / args.id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "id": args.id,
+        "name": args.name,
+        "version": "0.1.0",
+        "entrypoint": "plugin.py",
+        "description": f"{args.name} plugin for Metis",
+    }
+
+    if args.type == "tool":
+        manifest["tools"] = ["my_tool"]
+        manifest["required_permissions"] = ["read_only"]
+        plugin_py = _PLUGIN_TOOL_TEMPLATE
+    elif args.type == "gate":
+        manifest["eval_suites"] = ["my_gate"]
+        plugin_py = _PLUGIN_GATE_TEMPLATE
+    elif args.type == "prompt":
+        manifest["prompt_fragments"] = ["my_prompt_fragment"]
+        plugin_py = _PLUGIN_PROMPT_TEMPLATE
+    else:
+        plugin_py = _PLUGIN_EMPTY_TEMPLATE
+
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "plugin.py").write_text(plugin_py, encoding="utf-8")
+    (output_dir / "README.md").write_text(
+        f"# {args.name}\n\nA Metis plugin.\n", encoding="utf-8"
+    )
+
+    print(f"Plugin scaffold created: {output_dir}")
+    print(f"  manifest.json")
+    print(f"  plugin.py")
+    print(f"  README.md")
+    return 0
+
+
+_PLUGIN_EMPTY_TEMPLATE = '''"""Metis plugin entrypoint."""
+
+from __future__ import annotations
+
+from metis.plugins.api import PluginContext
+
+
+def register(context: PluginContext) -> None:
+    pass
+'''
+
+_PLUGIN_TOOL_TEMPLATE = '''"""Metis tool plugin."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from metis.plugins.api import PluginContext
+from metis.tools.spec import ToolContext, ToolSpec
+
+
+def _my_tool_handler(args: dict[str, Any], context: ToolContext) -> str:
+    return "Hello from my_tool!"
+
+
+def register(context: PluginContext) -> None:
+    context.register_tool(
+        ToolSpec(
+            name="my_tool",
+            description="Description of what my_tool does.",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+            handler=_my_tool_handler,
+            category="general",
+            side_effect="read",
+            permission_level="read_only",
+        )
+    )
+'''
+
+_PLUGIN_GATE_TEMPLATE = '''"""Metis quality gate plugin."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from metis.plugins.api import PluginContext
+from metis.quality.gates import GateResult, GateSpec
+
+
+def _my_gate_handler(context: dict[str, Any]) -> GateResult:
+    return GateResult("my_gate", True, "Gate passed", {})
+
+
+def register(context: PluginContext) -> None:
+    context.register_quality_gate(
+        GateSpec(
+            name="my_gate",
+            description="Description of what my_gate checks.",
+            handler=_my_gate_handler,
+            failure_policy="fail",
+        )
+    )
+'''
+
+_PLUGIN_PROMPT_TEMPLATE = '''"""Metis prompt fragment plugin."""
+
+from __future__ import annotations
+
+from metis.plugins.api import PluginContext
+
+
+def register(context: PluginContext) -> None:
+    context.register_prompt_fragment("Your prompt fragment text here.")
+'''
 
 
 def _plugin_inspect(args: argparse.Namespace) -> int:
@@ -373,6 +581,15 @@ def _plugin_inspect(args: argparse.Namespace) -> int:
         if manifest.required_permissions:
             print(f"Required permissions: {', '.join(manifest.required_permissions)}")
     return 0 if not validation_errors else 1
+
+
+async def _mcp_server(args: argparse.Namespace) -> int:
+    manifest = load_app_manifest(args.manifest, workspace=args.workspace)
+    registry = ToolRegistry()
+    register_builtin_tools(registry, workspace=manifest.workspace or args.workspace)
+    server = MCPServer(registry, name=args.name)
+    await server.run()
+    return 0
 
 
 def _checkpoint_list(args: argparse.Namespace) -> int:
@@ -410,31 +627,101 @@ def _checkpoint_latest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _default_state_db_path(workspace: str) -> str:
+    from pathlib import Path
+    db_dir = Path(workspace) / ".metis"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    return str(db_dir / "state.db")
+
+
+def _build_progress_hooks(max_turns: int):
+    """Build a HookBus that prints concise progress to stderr."""
+    from metis.events.hooks import HookBus
+    from metis.events.event_types import EventType
+    hooks = HookBus()
+
+    def _on_model_pre(data: dict):
+        turn = data.get("turn", 0) + 1
+        print(f"  Turn {turn}/{max_turns}", file=sys.stderr, end="\r")
+
+    def _on_tool_pre(data: dict):
+        name = data.get("tool_name", "tool")
+        print(f"  Turn {data.get('turn', 0) + 1}/{max_turns} -> {name}     ", file=sys.stderr, end="\r")
+
+    def _on_post_run(data: dict):
+        print(" " * 60, file=sys.stderr, end="\r")  # Clear line
+
+    hooks.register(EventType.MODEL_PRE_CALL, _on_model_pre, priority=200)
+    hooks.register(EventType.TOOL_PRE_DISPATCH, _on_tool_pre, priority=200)
+    hooks.register(EventType.AGENT_POST_RUN, _on_post_run, priority=200)
+    return hooks
+
+
 async def _run(args: argparse.Namespace) -> int:
     registry = ToolRegistry()
     register_builtin_tools(registry, workspace=args.workspace)
     manifest = load_app_manifest(getattr(args, "manifest", None), workspace=args.workspace)
-    if args.state_db:
-        manifest = replace(manifest, state_db_path=args.state_db)
-    state = SQLiteStateStore(args.state_db) if args.state_db else None
-    loop = AgentLoop(
-        provider=OpenAICompatibleProvider(model=manifest.model, base_url=manifest.base_url or None),
-        registry=registry,
-        workspace=args.workspace,
-        profile=manifest.profile,
-        state=state,
-        evidence_ledger=EvidenceLedger(state) if state is not None else None,
-    )
-    result = await loop.run(
-        AgentRunRequest(
-            messages=build_runtime_messages(args.task, manifest=manifest, workspace=args.workspace),
-            max_turns=args.max_turns,
-            session_id=args.session_id,
-            task_contract_hash=build_runtime_task_contract(args.task, manifest=manifest).contract_hash(),
-            prompt_stack_hash=build_runtime_prompt_stack(args.task, manifest=manifest, workspace=args.workspace).stack_hash(),
-            allowed_tool_permissions=manifest_allowed_tool_permissions(manifest),
+    # CLI overrides for provider config
+    if getattr(args, "model", None):
+        manifest = replace(manifest, model=args.model)
+    if getattr(args, "base_url", None):
+        manifest = replace(manifest, base_url=args.base_url)
+    if getattr(args, "api_key", None):
+        os.environ["METIS_API_KEY"] = args.api_key
+
+    # Merge CLI MCP configs into manifest
+    mcp_configs = []
+    for mcp_str in getattr(args, "mcp", []):
+        try:
+            mcp_configs.append(json.loads(mcp_str))
+        except json.JSONDecodeError as exc:
+            print(f"Error: Invalid --mcp JSON: {exc}", file=sys.stderr)
+            return 1
+    if mcp_configs:
+        manifest = replace(manifest, mcp_servers=manifest.mcp_servers + mcp_configs)
+
+    # Auto-create state db unless explicitly disabled with --state-db=""
+    state_db = getattr(args, "state_db", None)
+    if state_db is None:
+        state_db = _default_state_db_path(args.workspace)
+        manifest = replace(manifest, state_db_path=state_db)
+    elif state_db == "":
+        state_db = None
+    else:
+        manifest = replace(manifest, state_db_path=state_db)
+
+    state = SQLiteStateStore(state_db) if state_db else None
+    hooks = _build_progress_hooks(args.max_turns)
+    try:
+        loop = AgentLoop(
+            provider=build_provider(model=manifest.model, base_url=manifest.base_url or None),
+            registry=registry,
+            workspace=args.workspace,
+            profile=manifest.profile,
+            state=state,
+            evidence_ledger=EvidenceLedger(state) if state is not None else None,
+            hooks=hooks,
         )
-    )
+    except Exception as exc:
+        print(f"Error: Failed to initialize provider: {exc}", file=sys.stderr)
+        print("Hint: Set METIS_BASE_URL and METIS_API_KEY environment variables, or use --base-url and --api-key.", file=sys.stderr)
+        return 1
+
+    try:
+        result = await loop.run(
+            AgentRunRequest(
+                messages=build_runtime_messages(args.task, manifest=manifest, workspace=args.workspace),
+                max_turns=args.max_turns,
+                session_id=args.session_id,
+                task_contract_hash=build_runtime_task_contract(args.task, manifest=manifest).contract_hash(),
+                prompt_stack_hash=build_runtime_prompt_stack(args.task, manifest=manifest, workspace=args.workspace).stack_hash(),
+                allowed_tool_permissions=manifest_allowed_tool_permissions(manifest),
+            )
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
     print(result.final_text)
     return 0 if result.status == "final" else 1
 
@@ -444,31 +731,41 @@ async def _resume(args: argparse.Namespace) -> int:
     prior_messages = store.list_messages(args.session_id)
     if not prior_messages:
         print(f"No persisted messages found for session: {args.session_id}", file=sys.stderr)
+        print(f"Hint: Run with --state-db {args.state_db} first to create a persisted session.", file=sys.stderr)
         return 1
     manifest = load_app_manifest(getattr(args, "manifest", None), workspace=args.workspace)
     registry = ToolRegistry()
     register_builtin_tools(registry, workspace=args.workspace)
-    loop = AgentLoop(
-        provider=OpenAICompatibleProvider(model=manifest.model, base_url=manifest.base_url or None),
-        registry=registry,
-        workspace=args.workspace,
-        profile=manifest.profile,
-        state=store,
-    )
+    try:
+        loop = AgentLoop(
+            provider=build_provider(model=manifest.model, base_url=manifest.base_url or None),
+            registry=registry,
+            workspace=args.workspace,
+            profile=manifest.profile,
+            state=store,
+        )
+    except Exception as exc:
+        print(f"Error: Failed to initialize provider: {exc}", file=sys.stderr)
+        print("Hint: Set METIS_BASE_URL and METIS_API_KEY environment variables, or use --base-url and --api-key.", file=sys.stderr)
+        return 1
     store.append_message(args.session_id, "user", args.message, {"source": "resume"})
     task_contract = build_runtime_task_contract(args.message, manifest=manifest)
     prompt_stack = build_runtime_prompt_stack(args.message, manifest=manifest, workspace=args.workspace, task_contract=task_contract)
-    result = await loop.run(
-        AgentRunRequest(
-            messages=prior_messages + [{"role": "user", "content": args.message}],
-            max_turns=args.max_turns,
-            session_id=args.session_id,
-            task_contract_hash=task_contract.contract_hash(),
-            prompt_stack_hash=prompt_stack.stack_hash(),
-            allowed_tool_permissions=manifest_allowed_tool_permissions(manifest),
-            resume_from_checkpoint=True,
+    try:
+        result = await loop.run(
+            AgentRunRequest(
+                messages=prior_messages + [{"role": "user", "content": args.message}],
+                max_turns=args.max_turns,
+                session_id=args.session_id,
+                task_contract_hash=task_contract.contract_hash(),
+                prompt_stack_hash=prompt_stack.stack_hash(),
+                allowed_tool_permissions=manifest_allowed_tool_permissions(manifest),
+                resume_from_checkpoint=True,
+            )
         )
-    )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     print(result.final_text)
     return 0 if result.status == "final" else 1
 
@@ -476,6 +773,10 @@ async def _resume(args: argparse.Namespace) -> int:
 def _app_init(args: argparse.Namespace) -> int:
     path = write_default_app_manifest(args.output, name=args.name, workspace=args.workspace)
     print(f"Metis app manifest written to: {path}")
+    print("\nNext steps:")
+    print(f"  1. Edit {path} to set base_url and model")
+    print("  2. Set your API key: export METIS_API_KEY='sk-...'")
+    print(f"  3. Run: metis run \"Your task\" --manifest {path}")
     return 0
 
 
@@ -505,6 +806,26 @@ def _web(args: argparse.Namespace) -> int:
     print(f"{manifest.name} Web UI")
     print(f"Workspace: {manifest.workspace}")
     print(f"Model: {manifest.model}")
+    print(f"URL: http://{args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    return 0
+
+
+def _swarm(args: argparse.Namespace) -> int:
+    try:
+        import uvicorn
+    except ImportError:
+        print("Metis Swarm Hub requires uvicorn. Install with: pip install 'metis-agent-harness[ui]'", file=sys.stderr)
+        return 2
+    from metis.swarm.hub import create_hub_app
+    from metis.swarm.registry import AgentRegistry
+    registry = AgentRegistry()
+    if args.scan:
+        found = registry.scan(args.scan, recursive=True)
+        if found:
+            print(f"Discovered {len(found)} agent(s) in {args.scan}")
+    app = create_hub_app()
+    print("Metis Swarm Hub")
     print(f"URL: http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
@@ -1432,11 +1753,62 @@ def _package_export(args: argparse.Namespace) -> int:
 
 
 def _trace_show(args: argparse.Namespace) -> int:
+    import json as _json
     timeline = load_timeline(args.timeline)
+    trace_events = timeline.get("trace_events", timeline if isinstance(timeline, list) else [])
     if args.json:
         print(timeline_to_json(timeline))
+    elif args.html:
+        from metis.viz.trace_renderer import render_trace_timeline
+        print(render_trace_timeline(trace_events))
+    elif args.ascii:
+        from metis.viz.trace_renderer import render_trace_ascii
+        print(render_trace_ascii(trace_events))
+    elif args.mermaid:
+        from metis.viz.trace_renderer import render_trace_mermaid
+        print(render_trace_mermaid(trace_events))
     else:
         print(timeline_to_markdown(timeline, include_payload=args.include_payload))
+    return 0
+
+
+def _trace_report(args: argparse.Namespace) -> int:
+    import json as _json
+    from pathlib import Path
+    from metis.runtime.response import AgentRunResult, ToolResult
+    from metis.viz.report import generate_html_report, generate_json_report
+
+    data = _json.loads(Path(args.result).read_text(encoding="utf-8"))
+    tool_results = [
+        ToolResult(
+            tool_name=tr.get("tool_name", tr.get("name", "")),
+            content=tr.get("content", ""),
+            status=tr.get("status", "ok"),
+            tool_call_id=tr.get("tool_call_id", ""),
+            error=tr.get("error"),
+            metadata=tr.get("metadata", {}),
+        )
+        for tr in data.get("tool_results", [])
+    ]
+    result = AgentRunResult(
+        status=data.get("status", "unknown"),
+        final_text=data.get("final_text", ""),
+        turns_used=data.get("turns_used", 0),
+        tool_results=tool_results,
+        trace_events=data.get("trace_events", []),
+        errors=data.get("errors", []),
+        usage=data.get("usage", {}),
+    )
+    session_id = data.get("session_id", "")
+    if args.json:
+        output = generate_json_report(result, session_id)
+    else:
+        output = generate_html_report(result, session_id, title=f"Session {session_id[:8]}")
+    if args.output:
+        Path(args.output).write_text(output, encoding="utf-8")
+        print(f"Report written to {args.output}")
+    else:
+        print(output)
     return 0
 
 
@@ -1454,6 +1826,13 @@ def _read_latest_run_dir(output_root: str) -> str | None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.version:
+        from metis import __version__
+        print(f"metis {__version__}")
+        return 0
+    if args.command is None:
+        parser.print_help()
+        return 1
     if args.command == "doctor":
         return cmd_doctor(args)
     if args.command == "run":
@@ -1464,6 +1843,8 @@ def main(argv: list[str] | None = None) -> int:
         return _tui(args)
     if args.command == "web":
         return _web(args)
+    if args.command == "swarm":
+        return _swarm(args)
     if args.command == "develop":
         return _develop(args)
     if args.command == "app" and args.app_command == "init":
@@ -1472,6 +1853,8 @@ def main(argv: list[str] | None = None) -> int:
         return _app_show(args)
     if args.command == "trace" and args.trace_command == "show":
         return _trace_show(args)
+    if args.command == "trace" and args.trace_command == "report":
+        return _trace_report(args)
     if args.command == "eval" and args.eval_suite == "real-small-model":
         return asyncio.run(_eval_real_small_model(args))
     if args.command == "eval" and args.eval_suite == "compare":
@@ -1516,10 +1899,14 @@ def main(argv: list[str] | None = None) -> int:
         return _provider_capabilities(args)
     if args.command == "plugin" and args.plugin_command == "inspect":
         return _plugin_inspect(args)
+    if args.command == "plugin" and args.plugin_command == "init":
+        return _plugin_init(args)
     if args.command == "checkpoint" and args.checkpoint_command == "list":
         return _checkpoint_list(args)
     if args.command == "checkpoint" and args.checkpoint_command == "latest":
         return _checkpoint_latest(args)
+    if args.command == "mcp-server":
+        return asyncio.run(_mcp_server(args))
     parser.print_help()
     return 1
 

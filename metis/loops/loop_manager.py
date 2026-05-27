@@ -105,17 +105,17 @@ class LoopManager:
                 return
             if spec.iterations >= spec.max_iterations:
                 self.state.update_loop_status(loop_id, "complete")
-                self.hooks.emit("loop.complete", {"loop_id": loop_id})
+                await self.hooks.emit_async("loop.complete", {"loop_id": loop_id})
                 return
 
             failed = False
             try:
-                self.hooks.emit("loop.tick", {"loop_id": loop_id, "iteration": spec.iterations + 1})
+                await self.hooks.emit_async("loop.tick", {"loop_id": loop_id, "iteration": spec.iterations + 1})
                 if self.execution_controller is not None:
                     await self.execution_controller.run_prompt(session_id=spec.session_id, prompt=spec.prompt)
             except Exception as exc:
                 failed = True
-                self.hooks.emit("loop.error", {"loop_id": loop_id, "error": str(exc)})
+                await self.hooks.emit_async("loop.error", {"loop_id": loop_id, "error": str(exc)})
             self.state.record_loop_tick(loop_id, failed=failed)
 
             updated = self.get(loop_id)
@@ -124,6 +124,6 @@ class LoopManager:
                 return
             if updated.iterations >= updated.max_iterations:
                 self.state.update_loop_status(loop_id, "complete")
-                self.hooks.emit("loop.complete", {"loop_id": loop_id})
+                await self.hooks.emit_async("loop.complete", {"loop_id": loop_id})
                 return
             await asyncio.sleep(updated.interval_seconds)

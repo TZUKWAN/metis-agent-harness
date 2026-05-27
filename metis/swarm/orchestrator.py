@@ -32,7 +32,7 @@ class SwarmOrchestrator:
         results: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         for stage in self.decomposer.decompose(task_text):
-            self.hooks.emit("swarm.stage_start", {"stage_id": stage.stage_id})
+            await self.hooks.emit_async("swarm.stage_start", {"stage_id": stage.stage_id})
             if stage.parallel:
                 stage_results = await asyncio.gather(
                     *(self._run_agent(agent, task_text) for agent in stage.agents),
@@ -61,5 +61,5 @@ class SwarmOrchestrator:
         result = await self.runner.run_agent(agent=agent, task_text=task_text)
         payload = {"agent_id": agent.agent_id, "role_id": agent.role_id, "result": result}
         self.bus.publish(agent.agent_id, payload)
-        self.hooks.emit("swarm.agent_complete", payload)
+        await self.hooks.emit_async("swarm.agent_complete", payload)
         return payload

@@ -12,11 +12,12 @@ from metis.tools.spec import ToolSpec
 
 
 class FakeProviderWithToolCall(BaseProvider):
-    def __init__(self, responses):
+    def __init__(self, responses, thinking=True):
         self.responses = list(responses)
         self._index = 0
         self.model = "glm-4.7-flash"
         self.last_messages = []
+        self._thinking = thinking
 
     async def complete(self, messages, tools=None, **params):
         self.last_messages = messages
@@ -31,7 +32,9 @@ class FakeProviderWithToolCall(BaseProvider):
         )
 
     def capabilities(self) -> ProviderCapabilities:
-        return ProviderCapabilities(provider_type="test", model=self.model)
+        return ProviderCapabilities(
+            provider_type="test", model=self.model, thinking=self._thinking
+        )
 
 
 def _registry():
@@ -45,7 +48,7 @@ async def test_assistant_message_gets_reasoning_content_on_tool_call():
     provider = FakeProviderWithToolCall([
         {"content": "ok", "tool_calls": [{"id": "c1", "name": "echo", "arguments": {}}]},
         {"content": "done"},
-    ])
+    ], thinking=True)
     loop = AgentLoop(
         provider=provider,
         registry=_registry(),
@@ -57,7 +60,6 @@ async def test_assistant_message_gets_reasoning_content_on_tool_call():
         messages=[{"role": "user", "content": "hi"}],
         max_turns=5,
     ))
-    # Check that the assistant message added to history has reasoning_content
     assistant_msgs = [m for m in result.messages if m.get("role") == "assistant"]
     assert len(assistant_msgs) >= 1
     tool_call_msg = [m for m in assistant_msgs if "tool_calls" in m][0]
@@ -69,7 +71,7 @@ async def test_provider_messages_sanitized_for_thinking_model():
     provider = FakeProviderWithToolCall([
         {"content": "ok", "tool_calls": [{"id": "c1", "name": "echo", "arguments": {}}]},
         {"content": "done"},
-    ])
+    ], thinking=True)
     loop = AgentLoop(
         provider=provider,
         registry=_registry(),
@@ -81,7 +83,6 @@ async def test_provider_messages_sanitized_for_thinking_model():
         messages=[{"role": "user", "content": "hi"}],
         max_turns=5,
     ))
-    # Second turn should receive sanitized messages
     second_turn_msgs = provider.last_messages
     assistant_with_tools = [m for m in second_turn_msgs if m.get("role") == "assistant" and "tool_calls" in m]
     for msg in assistant_with_tools:
@@ -92,15 +93,15 @@ def test_ensure_reasoning_content_skips_non_thinking_models():
     messages = [
         {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "echo"}}]},
     ]
-    result = AgentLoop._ensure_reasoning_content(messages, "gpt-4o")
+    result = AgentLoop._ensure_reasoning_content(messages, thinking_enabled=False)
     assert "reasoning_content" not in result[0]
 
 
-def test_ensure_reasoning_content_adds_for_glm47():
+def test_ensure_reasoning_content_adds_for_thinking_enabled():
     messages = [
         {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "echo"}}]},
     ]
-    result = AgentLoop._ensure_reasoning_content(messages, "glm-4.7-flash")
+    result = AgentLoop._ensure_reasoning_content(messages, thinking_enabled=True)
     assert result[0].get("reasoning_content") == ""
 
 
@@ -108,5 +109,5 @@ def test_ensure_reasoning_content_preserves_existing():
     messages = [
         {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}], "reasoning_content": "think"},
     ]
-    result = AgentLoop._ensure_reasoning_content(messages, "glm-4.7-flash")
+    result = AgentLoop._ensure_reasoning_content(messages, thinking_enabled=True)
     assert result[0].get("reasoning_content") == "think"

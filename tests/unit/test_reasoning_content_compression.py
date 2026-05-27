@@ -52,12 +52,12 @@ def test_compression_triggered_by_reasoning_content():
 
 def test_force_fit_preserves_reasoning_content():
     compressor = SimpleContextCompressor()
-    messages = [
-        {"role": "system", "content": "S"},
+    protected = [{"role": "system", "content": "S"}]
+    evictable = [
         {"role": "assistant", "content": "A", "reasoning_content": "R" * 200},
         {"role": "tool", "content": "ok", "name": "read"},
     ]
-    result = compressor._force_fit(messages, 50)
+    result = compressor._force_fit_with_protection(evictable, protected, 300)
     assistant_msgs = [m for m in result if m["role"] == "assistant"]
     assert len(assistant_msgs) == 1
     assert "R" in assistant_msgs[0].get("reasoning_content", "")

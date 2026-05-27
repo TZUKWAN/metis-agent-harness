@@ -140,9 +140,10 @@ def test_non_critical_tool_result_still_trimmed():
 
 
 def test_is_critical_tool_result_detects_error():
-    assert SimpleContextCompressor._is_critical_tool_result({"content": json.dumps({"error": "fail"}), "role": "tool"})
-    assert SimpleContextCompressor._is_critical_tool_result({"content": "something", "status": "failed", "role": "tool"})
-    assert not SimpleContextCompressor._is_critical_tool_result({"content": json.dumps({"result": "ok"}), "role": "tool"})
+    compressor = SimpleContextCompressor()
+    assert compressor._is_critical_tool_result({"content": json.dumps({"error": "fail"}), "role": "tool"})
+    assert compressor._is_critical_tool_result({"content": "something", "status": "failed", "role": "tool"})
+    assert not compressor._is_critical_tool_result({"content": json.dumps({"result": "ok"}), "role": "tool"})
 
 
 def test_summary_marks_critical_results():
@@ -151,5 +152,5 @@ def test_summary_marks_critical_results():
         {"role": "user", "content": "go"},
         {"role": "tool", "content": json.dumps({"error": "something went wrong"}), "name": "run_shell"},
     ]
-    summary = compressor._summarize(messages)
+    summary, _trimmed = compressor._summarize(messages)
     assert "[CRITICAL]" in summary

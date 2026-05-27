@@ -11,6 +11,11 @@ from metis.tools.registry import ToolRegistry
 from metis.tools.spec import ToolSpec
 
 
+def register_provider_type(name: str, cls: type) -> None:
+    from metis.providers.factory import register_provider
+    register_provider(name, cls)
+
+
 @dataclass(frozen=True)
 class PluginManifest:
     id: str
@@ -58,3 +63,6 @@ class PluginContext:
 
     def register_role_template(self, role: RoleTemplate) -> None:
         self.role_templates[role.role_id] = role
+
+    def register_provider_type(self, name: str, cls: type) -> None:
+        register_provider_type(name, cls)

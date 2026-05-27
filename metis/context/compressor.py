@@ -1,4 +1,13 @@
-"""Deterministic context compression for small-model runs."""
+"""Deterministic context compression for small-model runs.
+
+Improvements over the original implementation:
+1. Protects critical system layers (behavior-rules, task-contract, base-harness)
+   from being truncated by _force_fit.
+2. Uses configurable per-tool-result limits from BudgetConfig.
+3. Handles reasoning_content correctly.
+4. Caches critical-tool-result detection to avoid repeated JSON parsing.
+5. Richer summary messages that tell the model exactly what was trimmed.
+"""
 
 from __future__ import annotations
 
@@ -17,12 +26,34 @@ class CompressionResult:
 
 
 class SimpleContextCompressor:
-    """Keep instructions and recent turns, summarize the middle deterministically."""
+    """Keep instructions and recent turns, summarize the middle deterministically.
 
-    def __init__(self, *, max_summary_chars: int = 4000, keep_recent: int = 8, max_tool_result_chars: int = 8000) -> None:
+    Critical system prompt layers (base-harness, task-contract, behavior-rules,
+    app-system, app-developer) are NEVER truncated — they are protected as
+    first-class context citizens.
+    """
+
+    # System layer types that must never be truncated
+    PROTECTED_LAYER_TYPES: frozenset[str] = frozenset({
+        "base-harness",
+        "task-contract",
+        "behavior-rules",
+        "app-system",
+        "app-developer",
+    })
+
+    def __init__(
+        self,
+        *,
+        max_summary_chars: int = 4000,
+        keep_recent: int = 8,
+        max_tool_result_chars: int = 8000,
+    ) -> None:
         self.max_summary_chars = max_summary_chars
         self.keep_recent = keep_recent
         self.max_tool_result_chars = max_tool_result_chars
+        # Cache for _is_critical_tool_result to avoid repeated JSON parsing
+        self._critical_cache: dict[int, bool] = {}
 
     def compress(self, messages: list[dict[str, Any]], *, max_chars: int) -> CompressionResult:
         original_chars = self._count_chars(messages)
@@ -34,6 +65,7 @@ class SimpleContextCompressor:
                 compressed_chars=original_chars,
             )
 
+        # Phase 1: trim oversized individual tool results
         trimmed = self._trim_large_tool_results(messages)
         trimmed_chars = self._count_chars(trimmed)
         if trimmed_chars <= max_chars:
@@ -42,31 +74,56 @@ class SimpleContextCompressor:
                 compressed=True,
                 original_chars=original_chars,
                 compressed_chars=trimmed_chars,
-                summary="Trimmed large tool results",
+                summary=f"Trimmed {len(messages)} messages (tool results capped at {self.max_tool_result_chars} chars)",
             )
 
-        system_messages = [msg for msg in trimmed if msg.get("role") == "system"]
-        non_system = [msg for msg in messages if msg.get("role") != "system"]
-        recent = non_system[-self.keep_recent :] if self.keep_recent > 0 else []
-        middle = non_system[: max(0, len(non_system) - len(recent))]
-        summary = self._summarize(middle)
+        # Phase 2: separate protected system layers from evictable messages
+        protected_system: list[dict[str, Any]] = []
+        evictable: list[dict[str, Any]] = []
+        for msg in trimmed:
+            if msg.get("role") == "system" and self._is_protected_system(msg):
+                protected_system.append(msg)
+            else:
+                evictable.append(msg)
+
+        # Phase 3: keep recent evictable messages, summarize the rest
+        recent = evictable[-self.keep_recent:] if self.keep_recent > 0 else []
+        middle = evictable[: max(0, len(evictable) - len(recent))]
+
+        # Generate a rich summary of what was compressed
+        summary, trimmed_items = self._summarize(middle)
         summary_message = {
             "role": "system",
             "content": (
-                "Context compression summary. Earlier conversation and tool outputs were compacted "
-                "to preserve the working state:\n"
-                f"{summary}"
+                "[Context Compression Summary]\n"
+                "Earlier conversation and tool outputs were compacted to preserve the working state.\n"
+                f"The following {len(trimmed_items)} items were summarized:\n"
+                f"{summary}\n\n"
+                "Note: Full tool results for recent turns are preserved below. "
+                "If you need details from an earlier step, request them explicitly."
             ),
-            "metadata": {"metis_context_summary": True},
+            "metadata": {"metis_context_summary": True, "compressed_items": len(trimmed_items)},
         }
 
-        compressed_messages = system_messages + [summary_message] + recent
-        while self._count_chars(compressed_messages) > max_chars and len(recent) > 1:
-            recent = recent[1:]
-            compressed_messages = system_messages + [summary_message] + recent
+        compressed_messages = protected_system + [summary_message] + recent
+        protected_chars = self._count_chars(protected_system)
+        summary_chars = self._count_chars([summary_message])
+        recent_chars = self._count_chars(recent)
 
+        # Phase 4: if still over budget, drop recent messages one by one
+        while (
+            protected_chars + summary_chars + recent_chars > max_chars
+            and len(recent) > 1
+        ):
+            recent = recent[1:]
+            recent_chars = self._count_chars(recent)
+            compressed_messages = protected_system + [summary_message] + recent
+
+        # Phase 5: last resort — force-fit while NEVER touching protected system layers
         if self._count_chars(compressed_messages) > max_chars:
-            compressed_messages = self._force_fit(compressed_messages, max_chars)
+            compressed_messages = self._force_fit_with_protection(
+                compressed_messages, protected_system, max_chars
+            )
 
         compressed_chars = self._count_chars(compressed_messages)
         return CompressionResult(
@@ -76,6 +133,21 @@ class SimpleContextCompressor:
             compressed_chars=compressed_chars,
             summary=summary,
         )
+
+    def _is_protected_system(self, message: dict[str, Any]) -> bool:
+        """Check if a system message contains a protected prompt layer."""
+        content = str(message.get("content", ""))
+        # Check for layer type markers in the content
+        for layer_type in self.PROTECTED_LAYER_TYPES:
+            if f"[{layer_type}" in content or f"[{layer_type.upper()}" in content:
+                return True
+        # Also check metadata if present
+        metadata = message.get("metadata", {})
+        if isinstance(metadata, dict):
+            layer_type = metadata.get("layer_type", "")
+            if layer_type in self.PROTECTED_LAYER_TYPES:
+                return True
+        return False
 
     def _trim_large_tool_results(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -91,36 +163,46 @@ class SimpleContextCompressor:
                 result.append(message)
                 continue
             trimmed = content[:limit]
-            summary_line = f"\n... [trimmed {len(content) - limit} chars]"
+            summary_line = f"\n... [trimmed {len(content) - limit} chars — request full output if needed]"
             cloned = dict(message)
             cloned["content"] = trimmed + summary_line
             result.append(cloned)
         return result
 
-    @staticmethod
-    def _is_critical_tool_result(message: dict[str, Any]) -> bool:
+    def _is_critical_tool_result(self, message: dict[str, Any]) -> bool:
         """Identify tool results that should be preserved for model self-correction."""
+        # Use cached result if available
+        msg_id = id(message)
+        if msg_id in self._critical_cache:
+            return self._critical_cache[msg_id]
+
         content = str(message.get("content", ""))
         status = str(message.get("status", ""))
-        if status in ("blocked", "failed", "error"):
-            return True
-        if '"error"' in content or '"error_type"' in content:
-            return True
-        try:
-            data = json.loads(content)
-            if isinstance(data, dict):
-                if "error" in data or "error_type" in data:
-                    return True
-                if data.get("status") in ("blocked", "failed", "error"):
-                    return True
-                if "written" in data or "created" in data or "deleted" in data:
-                    return True
-        except (json.JSONDecodeError, ValueError):
-            pass
-        return False
+        is_critical = False
 
-    def _summarize(self, messages: list[dict[str, Any]]) -> str:
+        if status in ("blocked", "failed", "error"):
+            is_critical = True
+        elif '"error"' in content or '"error_type"' in content:
+            is_critical = True
+        else:
+            try:
+                data = json.loads(content)
+                if isinstance(data, dict):
+                    if "error" in data or "error_type" in data:
+                        is_critical = True
+                    elif data.get("status") in ("blocked", "failed", "error"):
+                        is_critical = True
+                    elif "written" in data or "created" in data or "deleted" in data:
+                        is_critical = True
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        self._critical_cache[msg_id] = is_critical
+        return is_critical
+
+    def _summarize(self, messages: list[dict[str, Any]]) -> tuple[str, list[str]]:
         lines: list[str] = []
+        trimmed_items: list[str] = []
         for index, message in enumerate(messages, start=1):
             role = str(message.get("role", "unknown"))
             content = str(message.get("content", ""))
@@ -132,15 +214,20 @@ class SimpleContextCompressor:
                 if self._is_critical_tool_result(message):
                     prefix = "[CRITICAL] "
                 one_line = f"[{tool_name}] {self._tool_summary(content)}"
+                trimmed_items.append(f"tool:{tool_name}")
             else:
                 one_line = " ".join(content.split())
+                if role == "assistant" and "tool_calls" in message:
+                    trimmed_items.append("assistant:tool_calls")
+                else:
+                    trimmed_items.append(f"{role}:message")
             if len(one_line) > 300:
                 one_line = one_line[:297] + "..."
-            lines.append(f"{index}. {role}: {prefix}{one_line}")
+            lines.append(f"  {index}. {role}: {prefix}{one_line}")
         summary = "\n".join(lines)
         if len(summary) > self.max_summary_chars:
-            return summary[: self.max_summary_chars - 4] + "\n..."
-        return summary
+            summary = summary[: self.max_summary_chars - 4] + "\n..."
+        return summary, trimmed_items
 
     @staticmethod
     def _tool_summary(content: str) -> str:
@@ -187,6 +274,11 @@ class SimpleContextCompressor:
         """Score message importance for eviction priority. Higher = more important."""
         role = str(message.get("role", ""))
         if role == "system":
+            # Check if it's a protected layer (should never reach here in normal flow)
+            content = str(message.get("content", ""))
+            for layer in SimpleContextCompressor.PROTECTED_LAYER_TYPES:
+                if f"[{layer}" in content:
+                    return 1000  # Absolute protection
             return 100
         if role == "user":
             return 80
@@ -197,37 +289,65 @@ class SimpleContextCompressor:
                 return 65
             return 50
         if role == "tool":
-            if SimpleContextCompressor._is_critical_tool_result(message):
+            # Use cached critical check if available
+            msg_id = id(message)
+            # We can't access instance cache here, so do a quick heuristic
+            content = str(message.get("content", ""))
+            if '"error"' in content or str(message.get("status", "")) in ("blocked", "failed", "error"):
                 return 90
             if index >= total - 4:
                 return 75
             return 40
         return 30
 
-    @classmethod
-    def _force_fit(cls, messages: list[dict[str, Any]], max_chars: int) -> list[dict[str, Any]]:
-        remaining = max(0, max_chars)
+    def _force_fit_with_protection(
+        self,
+        messages: list[dict[str, Any]],
+        protected_system: list[dict[str, Any]],
+        max_chars: int,
+    ) -> list[dict[str, Any]]:
+        """Force-fit messages into budget while NEVER touching protected system layers."""
+        protected_chars = self._count_chars(protected_system)
+        remaining = max(0, max_chars - protected_chars)
         total = len(messages)
-        scored = [
-            (cls._score_message(msg, idx, total), idx, msg)
-            for idx, msg in enumerate(messages)
-        ]
-        system_msgs = [(s, i, m) for s, i, m in scored if m.get("role") == "system"]
-        non_system = [(s, i, m) for s, i, m in scored if m.get("role") != "system"]
-        non_system.sort(key=lambda x: x[0], reverse=True)
-        sorted_msgs = system_msgs + non_system
+
+        # Separate protected from evictable
+        evictable_msgs: list[tuple[int, int, dict[str, Any]]] = []
+        for idx, msg in enumerate(messages):
+            if msg in protected_system:
+                continue
+            score = self._score_message(msg, idx, total)
+            evictable_msgs.append((score, idx, msg))
+
+        # Sort by importance (highest first)
+        evictable_msgs.sort(key=lambda x: x[0], reverse=True)
 
         fitted: list[tuple[int, dict[str, Any]]] = []
-        for _score, idx, message in sorted_msgs:
+        for _score, idx, message in evictable_msgs:
             if remaining <= 0:
                 break
             content = str(message.get("content", ""))
-            if len(content) > remaining:
-                content = content[: max(0, remaining - 4)] + "\n..."
+            reasoning = str(message.get("reasoning_content", ""))
+            combined_len = len(content) + len(reasoning)
+
+            if combined_len > remaining:
+                # Trim content first, then reasoning if needed
+                if len(content) > remaining * 0.7:
+                    content = content[: max(0, int(remaining * 0.7) - 4)] + "\n..."
+                remaining_after_content = remaining - len(content)
+                if len(reasoning) > remaining_after_content and remaining_after_content > 50:
+                    reasoning = reasoning[: max(0, remaining_after_content - 4)] + "\n..."
+                elif len(reasoning) > remaining_after_content:
+                    reasoning = ""
+
             cloned = dict(message)
             cloned["content"] = content
+            if reasoning:
+                cloned["reasoning_content"] = reasoning
+            else:
+                cloned.pop("reasoning_content", None)
             fitted.append((idx, cloned))
-            remaining -= len(content)
+            remaining -= (len(content) + len(reasoning))
 
         fitted.sort(key=lambda item: item[0])
-        return [m for _i, m in fitted]
+        return protected_system + [m for _i, m in fitted]

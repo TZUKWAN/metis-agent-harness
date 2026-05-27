@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metis-agent-harness"
-version = "0.1.0"
+version = "0.2.0"
 description = "A domain-neutral agent harness runtime for controlled tool use, stateful execution, and small-model reliability."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,18 +13,16 @@ dependencies = [
     "openpyxl>=3.1",
     "python-docx>=1.0",
     "python-pptx>=1.0",
+    "rich>=13",
+    "textual>=0.70",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
 ]
 
 [project.optional-dependencies]
-ui = [
-    "fastapi>=0.110",
-    "uvicorn>=0.27",
-]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
-    "fastapi>=0.110",
-    "uvicorn>=0.27",
 ]
 
 [project.scripts]

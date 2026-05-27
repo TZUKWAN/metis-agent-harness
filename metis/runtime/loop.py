@@ -8,6 +8,7 @@ import shlex
 import time
 from typing import Any, Protocol, runtime_checkable
 
+from metis.config import MAX_SAME_TOOL_PER_SESSION, TEMP_BASE, TEMP_LOOP_BOOST, TEMP_MAX, TEMP_PER_TURN, TEMP_REPAIR_BOOST
 from metis.context.engine import ContextEngine
 from metis.evidence.extractor import ToolEvidenceExtractor
 from metis.evidence.resolver import EvidenceResolver
@@ -56,7 +57,7 @@ class AgentLoop:
     """Execute model calls and tool calls until a final response or max_turns."""
 
     _SESSION_TOOL_COUNTS: dict[str, dict[str, int]] = {}
-    _MAX_SAME_TOOL_PER_SESSION = 20
+    _MAX_SAME_TOOL_PER_SESSION = MAX_SAME_TOOL_PER_SESSION
     _SESSION_TOOL_FAILURES: dict[str, dict[str, list[float]]] = {}
     _CIRCUIT_BREAKER_THRESHOLD = 3
     _CIRCUIT_BREAKER_WINDOW = 300
@@ -64,6 +65,11 @@ class AgentLoop:
     _MAX_TRACKED_SESSIONS = 1000
     _SESSION_ACTIVITY_TTL = 3600
     _SESSION_LAST_ACTIVITY: dict[str, float] = {}
+
+    def __init_instance_state(self) -> None:
+        self._session_tool_counts: dict[str, dict[str, int]] = {}
+        self._session_tool_failures: dict[str, dict[str, list[float]]] = {}
+        self._session_last_activity: dict[str, float] = {}
 
     def __init__(
         self,
@@ -124,6 +130,7 @@ class AgentLoop:
         self.evidence_extractor = evidence_extractor or ToolEvidenceExtractor()
         self.workspace = workspace
         self.state = state
+        self.__init_instance_state()
 
     async def run(self, request: AgentRunRequest) -> AgentRunResult:
         logger.info("Agent run started session=%s max_turns=%d profile=%s", request.session_id, request.max_turns, self.profile.name)
@@ -139,9 +146,9 @@ class AgentLoop:
         tool_result_cache: dict[str, ToolResult] = {}
         agent_memory: dict[str, str] = {}
         turn_signatures: list[str] = []
-        AgentLoop._SESSION_TOOL_COUNTS.pop(request.session_id, None)
-        AgentLoop._SESSION_TOOL_FAILURES.pop(request.session_id, None)
-        AgentLoop._SESSION_LAST_ACTIVITY[request.session_id] = time.monotonic()
+        self._session_tool_counts.pop(request.session_id, None)
+        self._session_tool_failures.pop(request.session_id, None)
+        self._session_last_activity[request.session_id] = time.monotonic()
         AgentLoop._prune_session_state()
 
         self._record_trace_event(
@@ -159,7 +166,7 @@ class AgentLoop:
                 "request_id": request.request_id,
             },
         )
-        self.hooks.emit(EventType.AGENT_PRE_RUN, {"session_id": request.session_id})
+        await self.hooks.emit_async(EventType.AGENT_PRE_RUN, {"session_id": request.session_id})
         if self.state is not None:
             self.state.create_session(request.session_id)
             self._record_checkpoint(
@@ -183,6 +190,15 @@ class AgentLoop:
         try:
             for turn_index in range(request.max_turns):
                 turn_start = time.monotonic()
+                await self.hooks.emit_async(
+                    EventType.BEHAVIOR_CHECKPOINT,
+                    {
+                        "session_id": request.session_id,
+                        "turn": turn_index + 1,
+                        "phase": "turn.start",
+                        "metadata": {"turns_used": turn_index, "max_turns": request.max_turns},
+                    },
+                )
                 if _is_shutdown_requested():
                     logger.warning("Shutdown requested at turn %d, saving checkpoint", turn_index + 1)
                     if self.state is not None:
@@ -207,13 +223,13 @@ class AgentLoop:
                     ToolRouteRequest(stage="execute", allowed_tools=request.allowed_tools, profile=self.profile)
                 )
 
-                self.hooks.emit(
+                await self.hooks.emit_async(
                     EventType.MODEL_PRE_CALL,
                     {"session_id": request.session_id, "turn": turn_index + 1, "tool_count": len(tool_schemas)},
                 )
-                context_result = self.context_engine.build(messages)
+                context_result = self.context_engine.build(messages, tool_schemas=tool_schemas)
                 provider_messages = self._ensure_reasoning_content(
-                    context_result.messages, getattr(self.provider, "model", "")
+                    context_result.messages, self.provider.capabilities().thinking
                 )
                 est_tokens = context_result.final_chars // max(1, self.context_engine.chars_per_token)
                 temperature = self._compute_temperature(
@@ -239,7 +255,7 @@ class AgentLoop:
                     },
                 )
                 if context_result.compressed:
-                    self.hooks.emit(
+                    await self.hooks.emit_async(
                         "context.compressed",
                         {
                             "session_id": request.session_id,
@@ -251,33 +267,87 @@ class AgentLoop:
                     )
                 try:
                     response = await asyncio.wait_for(
-                        self.provider.complete(
-                            provider_messages, tools=tool_schemas, temperature=temperature
+                        self._call_provider(
+                            provider_messages, tools=tool_schemas, temperature=temperature,
+                            session_id=request.session_id, turn=turn_index + 1,
                         ),
                         timeout=self.per_turn_timeout,
                     )
                 except Exception as exc:
                     error_str = str(exc).lower()
                     if "context" in error_str or "too long" in error_str or "length" in error_str:
-                        logger.warning("Turn %d context length error, truncating history", turn_index + 1)
+                        logger.warning("Turn %d context length error, aggressive recompression", turn_index + 1)
                         original_len = len(provider_messages)
-                        truncated = self._truncate_for_context(provider_messages)
-                        if len(truncated) < original_len:
+                        # Aggressive fallback: recompress with tighter budget instead of naive truncation
+                        aggressive_result = self.context_engine.build(
+                            messages,
+                            tool_schemas=tool_schemas,
+                        )
+                        # Force a tighter threshold by temporarily lowering budget
+                        from dataclasses import replace
+                        old_budget = self.context_engine.budget
+                        tighter_budget = replace(old_budget, context_threshold=old_budget.context_threshold * 0.7)
+                        self.context_engine.budget = tighter_budget
+                        try:
+                            aggressive_result = self.context_engine.build(messages, tool_schemas=tool_schemas)
+                        finally:
+                            self.context_engine.budget = old_budget
+
+                        recompressed = self._ensure_reasoning_content(
+                            aggressive_result.messages, self.provider.capabilities().thinking
+                        )
+                        if len(recompressed) < original_len:
                             self._record_trace_event(
-                                trace_events, "context.truncated", request.session_id,
-                                turn=turn_index + 1, status="truncated",
-                                attributes={"original_messages": original_len, "truncated_messages": len(truncated)},
+                                trace_events, "context.recompressed", request.session_id,
+                                turn=turn_index + 1, status="recompressed",
+                                attributes={
+                                    "original_messages": original_len,
+                                    "recompressed_messages": len(recompressed),
+                                    "original_tokens": aggressive_result.original_tokens,
+                                    "final_tokens": aggressive_result.final_tokens,
+                                    "tool_schema_tokens": aggressive_result.tool_schema_tokens,
+                                },
                             )
                             try:
                                 response = await asyncio.wait_for(
-                                    self.provider.complete(
-                                        truncated, tools=tool_schemas, temperature=temperature
+                                    self._call_provider(
+                                        recompressed, tools=tool_schemas, temperature=temperature,
+                                        session_id=request.session_id, turn=turn_index + 1,
                                     ),
                                     timeout=self.per_turn_timeout,
                                 )
                             except Exception as retry_exc:
-                                errors.append(f"Turn {turn_index + 1} failed after truncation: {retry_exc}")
-                                continue
+                                retry_error = str(retry_exc).lower()
+                                if "context" in retry_error or "too long" in retry_error or "length" in retry_error:
+                                    # Third-line defense: force-truncate and retry one more time
+                                    logger.warning("Turn %d still over context after recompression, force-truncating", turn_index + 1)
+                                    truncated = self._truncate_for_context(recompressed)
+                                    if len(truncated) < len(recompressed):
+                                        self._record_trace_event(
+                                            trace_events, "context.force_truncated", request.session_id,
+                                            turn=turn_index + 1, status="force_truncated",
+                                            attributes={
+                                                "original_messages": original_len,
+                                                "truncated_messages": len(truncated),
+                                            },
+                                        )
+                                        try:
+                                            response = await asyncio.wait_for(
+                                                self._call_provider(
+                                                    truncated, tools=tool_schemas, temperature=temperature,
+                                                    session_id=request.session_id, turn=turn_index + 1,
+                                                ),
+                                                timeout=self.per_turn_timeout,
+                                            )
+                                        except Exception as trunc_exc:
+                                            errors.append(f"Turn {turn_index + 1} failed after force-truncation: {trunc_exc}")
+                                            continue
+                                    else:
+                                        errors.append(f"Turn {turn_index + 1} failed: {retry_exc}")
+                                        continue
+                                else:
+                                    errors.append(f"Turn {turn_index + 1} failed after recompression: {retry_exc}")
+                                    continue
                         else:
                             errors.append(f"Turn {turn_index + 1} failed: {exc}")
                             continue
@@ -311,7 +381,7 @@ class AgentLoop:
                         request.session_id,
                         turn_index + 1,
                     )
-                self.hooks.emit(
+                await self.hooks.emit_async(
                     EventType.MODEL_POST_CALL,
                     {"session_id": request.session_id, "turn": turn_index + 1, "usage": response.usage},
                 )
@@ -325,7 +395,7 @@ class AgentLoop:
                     status="ok",
                     attributes={"turn_duration_ms": turn_duration_ms},
                 )
-                self.hooks.emit(
+                await self.hooks.emit_async(
                     "turn.complete",
                     {
                         "session_id": request.session_id,
@@ -334,8 +404,17 @@ class AgentLoop:
                         "tool_call_count": len(response.tool_calls),
                     },
                 )
+                await self.hooks.emit_async(
+                    EventType.BEHAVIOR_CHECKPOINT,
+                    {
+                        "session_id": request.session_id,
+                        "turn": turn_index + 1,
+                        "phase": "turn.complete",
+                        "metadata": {"tool_call_count": len(response.tool_calls), "turn_duration_ms": turn_duration_ms},
+                    },
+                )
                 if response.usage:
-                    self.hooks.emit(
+                    await self.hooks.emit_async(
                         "model.token_usage",
                         {
                             "session_id": request.session_id,
@@ -374,7 +453,7 @@ class AgentLoop:
                         errors=errors,
                         trace_events=trace_events,
                     )
-                    self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
+                    await self.hooks.emit_async(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
                     return result
 
                 if response.tool_calls and len(response.tool_calls) > self.profile.max_tool_calls_per_turn:
@@ -392,7 +471,7 @@ class AgentLoop:
                         errors=errors + [reason],
                         trace_events=trace_events,
                     )
-                    self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
+                    await self.hooks.emit_async(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
                     self._record_checkpoint(
                         request.session_id,
                         phase="agent.finalization",
@@ -480,7 +559,7 @@ class AgentLoop:
                             errors=errors,
                             trace_events=trace_events,
                         )
-                        self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
+                        await self.hooks.emit_async(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
                         return result
                 else:
                     for call in response.tool_calls:
@@ -504,9 +583,9 @@ class AgentLoop:
                                 errors=errors,
                                 trace_events=trace_events,
                             )
-                            self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
+                            await self.hooks.emit_async(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
                             return result
-                        self._dispatch_tool_call(
+                        await self._dispatch_tool_call(
                             call=call,
                             session_id=request.session_id,
                             turn_index=turn_index,
@@ -524,15 +603,15 @@ class AgentLoop:
 
             result = AgentRunResult(
                 status="max_turns",
-                final_text="",
+                final_text=f"[Agent reached the maximum turn limit ({request.max_turns}). The task may be incomplete. Try increasing --max-turns or breaking the task into smaller steps.]",
                 messages=messages,
                 turns_used=request.max_turns,
                 tool_results=all_tool_results,
                 usage=usage_totals,
-                errors=errors + ["Maximum turns reached"],
+                errors=errors + [f"Maximum turns reached ({request.max_turns})"],
                 trace_events=trace_events,
             )
-            self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
+            await self.hooks.emit_async(EventType.AGENT_POST_RUN, {"session_id": request.session_id, "status": result.status})
             return result
         except Exception as exc:
             from metis.recovery.classifier import ErrorClassifier
@@ -544,19 +623,79 @@ class AgentLoop:
                 status="error",
                 attributes={"error": f"{type(exc).__name__}: {exc}", "error_category": error_category},
             )
-            self.hooks.emit(EventType.AGENT_ERROR, {"session_id": request.session_id, "error": str(exc), "category": error_category})
+            await self.hooks.emit_async(EventType.AGENT_ERROR, {"session_id": request.session_id, "error": str(exc), "category": error_category})
             raise
         finally:
+            self._session_tool_counts.pop(request.session_id, None)
+            self._session_tool_failures.pop(request.session_id, None)
+            self._session_last_activity.pop(request.session_id, None)
             AgentLoop._cleanup_session_state(request.session_id)
+
+    async def _call_provider(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        temperature: float,
+        session_id: str,
+        turn: int,
+    ) -> NormalizedResponse:
+        """Call provider with streaming if supported, otherwise use complete()."""
+        if not self.provider.capabilities().streaming:
+            return await self.provider.complete(
+                messages, tools=tools, temperature=temperature
+            )
+
+        accumulated_content = ""
+        accumulated_reasoning: str | None = None
+        accumulated_tool_calls: list[Any] = []
+        usage: dict[str, Any] = {}
+        finish_reason = ""
+
+        async for chunk in self.provider.complete_stream(
+            messages, tools=tools, temperature=temperature
+        ):
+            if chunk.content:
+                if chunk.is_finished:
+                    accumulated_content = chunk.content
+                else:
+                    accumulated_content += chunk.content
+            if chunk.reasoning:
+                if accumulated_reasoning is None:
+                    accumulated_reasoning = ""
+                accumulated_reasoning += chunk.reasoning
+            if chunk.tool_calls:
+                accumulated_tool_calls = chunk.tool_calls
+            if chunk.usage:
+                usage = chunk.usage
+            if chunk.is_finished and chunk.content:
+                finish_reason = "stop"
+
+            await self.hooks.emit_async(
+                EventType.MODEL_STREAM_CHUNK,
+                {
+                    "session_id": session_id,
+                    "turn": turn,
+                    "content": chunk.content,
+                    "reasoning": chunk.reasoning,
+                    "is_finished": chunk.is_finished,
+                },
+            )
+
+        return NormalizedResponse(
+            content=accumulated_content,
+            reasoning=accumulated_reasoning,
+            tool_calls=accumulated_tool_calls,
+            finish_reason=finish_reason or "stop",
+            usage=usage,
+            raw={"streamed": True},
+        )
 
     @staticmethod
     def _ensure_reasoning_content(
-        messages: list[dict[str, Any]], model: str = ""
+        messages: list[dict[str, Any]], thinking_enabled: bool = False
     ) -> list[dict[str, Any]]:
         """Add empty reasoning_content to assistant tool call messages for thinking-enabled APIs."""
-        model_lower = model.lower()
-        thinking_models = ("glm-4.7", "glm-4.9", "glm-4.5", "claude")
-        if not any(prefix in model_lower for prefix in thinking_models):
+        if not thinking_enabled:
             return messages
         result: list[dict[str, Any]] = []
         for message in messages:
@@ -601,20 +740,15 @@ class AgentLoop:
         repair_failure_counts: dict[tuple[str, str], int],
         turn_signatures: list[str],
     ) -> float:
-        """Adjust temperature based on turn state to encourage response diversity.
-
-        Base 0.2, +0.05 per turn, +0.1 if repair failures exist,
-        +0.15 if loop risk detected (2 repeated signatures), clamped to [0.0, 0.8].
-        """
-        base = 0.2
-        turn_boost = min(turn_index * 0.05, 0.35)
-        repair_boost = 0.1 if any(c > 0 for c in repair_failure_counts.values()) else 0.0
+        """Adjust temperature based on turn state to encourage response diversity."""
+        turn_boost = min(turn_index * TEMP_PER_TURN, 0.35)
+        repair_boost = TEMP_REPAIR_BOOST if any(c > 0 for c in repair_failure_counts.values()) else 0.0
         loop_boost = 0.0
         if len(turn_signatures) >= 2:
             if turn_signatures[-1] == turn_signatures[-2]:
-                loop_boost = 0.15
-        temp = base + turn_boost + repair_boost + loop_boost
-        return round(max(0.0, min(0.8, temp)), 2)
+                loop_boost = TEMP_LOOP_BOOST
+        temp = TEMP_BASE + turn_boost + repair_boost + loop_boost
+        return round(max(0.0, min(TEMP_MAX, temp)), 2)
 
     @staticmethod
     def _compute_per_turn_timeout(max_output_tokens: int) -> int:
@@ -1107,7 +1241,7 @@ class AgentLoop:
                         tool_results=all_tool_results, usage=usage_totals,
                         errors=errors, trace_events=trace_events,
                     )
-                    self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": session_id, "status": result.status})
+                    await self.hooks.emit_async(EventType.AGENT_POST_RUN, {"session_id": session_id, "status": result.status})
                     return result
             else:
                 repaired_content = await self._repair_final_output(
@@ -1123,7 +1257,7 @@ class AgentLoop:
                         tool_results=all_tool_results, usage=usage_totals,
                         errors=errors, trace_events=trace_events,
                     )
-                    self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": session_id, "status": result.status})
+                    await self.hooks.emit_async(EventType.AGENT_POST_RUN, {"session_id": session_id, "status": result.status})
                     return result
                 parsed_final = self.strict_output_parser.parse(response.content)
                 strict_status = RuntimeStatus.from_strict_status(parsed_final.status)
@@ -1139,7 +1273,7 @@ class AgentLoop:
                         tool_results=all_tool_results, usage=usage_totals,
                         errors=errors, trace_events=trace_events,
                     )
-                    self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": session_id, "status": result.status})
+                    await self.hooks.emit_async(EventType.AGENT_POST_RUN, {"session_id": session_id, "status": result.status})
                     return result
         self._record_trace_event(
             trace_events, "finalization.check", session_id,
@@ -1153,11 +1287,19 @@ class AgentLoop:
             tool_results=all_tool_results,
             strict_output=parsed_final,
         )
-        final_errors = errors + finalization.errors
+        # Evaluate behavior-rules gates if enabled
+        behavior_gate_errors = self._run_behavior_gates(
+            session_id=session_id,
+            final_text=response.content or "",
+            tool_results=all_tool_results,
+            artifacts=self.artifact_store.list_artifacts(session_id) if self.artifact_store else [],
+            evidence=self.evidence_ledger.list_evidence(session_id) if self.evidence_ledger else [],
+        )
+        final_errors = errors + finalization.errors + behavior_gate_errors
         self._record_trace_event(
             trace_events, "finalization.result", session_id,
             turn=turn_index + 1, status=finalization.status,
-            attributes={"verified": finalization.verified, "error_count": len(finalization.errors)},
+            attributes={"verified": finalization.verified, "error_count": len(finalization.errors), "behavior_gate_errors": len(behavior_gate_errors)},
         )
         result = AgentRunResult(
             status=finalization.status, final_text=response.content or "",
@@ -1165,7 +1307,7 @@ class AgentLoop:
             turns_used=turn_index + 1, tool_results=all_tool_results,
             usage=usage_totals, errors=final_errors, trace_events=trace_events,
         )
-        self.hooks.emit(EventType.AGENT_POST_RUN, {"session_id": session_id, "status": result.status})
+        await self.hooks.emit_async(EventType.AGENT_POST_RUN, {"session_id": session_id, "status": result.status})
         self._record_checkpoint(
             session_id, phase="agent.finalization", status=result.status,
             task_contract_hash=task_contract_hash, prompt_stack_hash=prompt_stack_hash,
@@ -1173,7 +1315,7 @@ class AgentLoop:
         )
         return result
 
-    def _dispatch_tool_call(
+    async def _dispatch_tool_call(
         self,
         *,
         call: ToolCall,
@@ -1215,10 +1357,10 @@ class AgentLoop:
             tool_feedback = self._compact_feedback(self._tool_feedback_content(cached_result))
             messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": tool_feedback})
             return
-        session_counts = AgentLoop._SESSION_TOOL_COUNTS.setdefault(session_id, {})
+        session_counts = self._session_tool_counts.setdefault(session_id, {})
         session_counts[call.name] = session_counts.get(call.name, 0) + 1
-        if session_counts[call.name] > AgentLoop._MAX_SAME_TOOL_PER_SESSION:
-            error = f"Tool '{call.name}' rate limit exceeded: {session_counts[call.name]} calls, max={AgentLoop._MAX_SAME_TOOL_PER_SESSION} per session"
+        if session_counts[call.name] > self._MAX_SAME_TOOL_PER_SESSION:
+            error = f"Tool '{call.name}' rate limit exceeded: {session_counts[call.name]} calls, max={self._MAX_SAME_TOOL_PER_SESSION} per session"
             logger.warning(error)
             tool_result = ToolResult(
                 call.name,
@@ -1232,7 +1374,7 @@ class AgentLoop:
                 trace_events, "tool.rate_limited", session_id,
                 turn=turn_index + 1, status="blocked",
                 tool_name=call.name, tool_call_id=call.id,
-                attributes={"tool_count": session_counts[call.name], "limit": AgentLoop._MAX_SAME_TOOL_PER_SESSION},
+                attributes={"tool_count": session_counts[call.name], "limit": self._MAX_SAME_TOOL_PER_SESSION},
             )
             all_tool_results.append(tool_result)
             errors.append(error)
@@ -1244,7 +1386,7 @@ class AgentLoop:
                     error=tool_result.error, call_id=call.id or None,
                 )
             return
-        cb_result = AgentLoop._check_circuit_breaker(session_id, call.name)
+        cb_result = self._check_circuit_breaker(session_id, call.name)
         if cb_result is not None:
             logger.warning(cb_result)
             tool_result = ToolResult(
@@ -1281,7 +1423,7 @@ class AgentLoop:
             call, exhausted_retry_fingerprints, exhausted_shape_fingerprints,
         )
         if tool_result is None:
-            tool_result = self.dispatcher.dispatch(
+            tool_result = await self.dispatcher.dispatch(
                 call,
                 ToolContext(
                     session_id=session_id, workspace=self.workspace,
@@ -1319,7 +1461,7 @@ class AgentLoop:
             )
         if tool_result.failed:
             errors.append(tool_result.error or tool_result.content)
-            AgentLoop._record_tool_failure(session_id, call.name)
+            self._record_tool_failure(session_id, call.name)
         if self.evidence_ledger is not None:
             evidence_refs: list[str] = []
             for extracted in self.evidence_extractor.extract(tool_result):
@@ -1383,7 +1525,7 @@ class AgentLoop:
                     attributes={"total_tool_calls": total_tool_calls, "limit": self.profile.max_session_tool_calls},
                 )
                 return
-            self._dispatch_tool_call(
+            await self._dispatch_tool_call(
                 call=call,
                 session_id=session_id,
                 turn_index=turn_index,
@@ -1412,11 +1554,10 @@ class AgentLoop:
 
         return total_tool_calls
 
-    @staticmethod
-    def _check_circuit_breaker(session_id: str, tool_name: str) -> str | None:
+    def _check_circuit_breaker(self, session_id: str, tool_name: str) -> str | None:
         """Return error message if tool is circuit-broken, else None."""
         now = time.monotonic()
-        failures = AgentLoop._SESSION_TOOL_FAILURES.get(session_id, {}).get(tool_name, [])
+        failures = self._session_tool_failures.get(session_id, {}).get(tool_name, [])
         window_start = now - AgentLoop._CIRCUIT_BREAKER_WINDOW
         recent = [t for t in failures if t >= window_start]
         if len(recent) >= AgentLoop._CIRCUIT_BREAKER_THRESHOLD:
@@ -1429,15 +1570,52 @@ class AgentLoop:
                 )
         return None
 
-    @staticmethod
-    def _record_tool_failure(session_id: str, tool_name: str) -> None:
+    def _record_tool_failure(self, session_id: str, tool_name: str) -> None:
         """Record a tool failure for circuit breaker tracking."""
-        session_failures = AgentLoop._SESSION_TOOL_FAILURES.setdefault(session_id, {})
+        session_failures = self._session_tool_failures.setdefault(session_id, {})
         tool_failures = session_failures.setdefault(tool_name, [])
         now = time.monotonic()
         window_start = now - AgentLoop._CIRCUIT_BREAKER_WINDOW
         tool_failures[:] = [t for t in tool_failures if t >= window_start]
         tool_failures.append(now)
+
+    def _run_behavior_gates(
+        self,
+        *,
+        session_id: str,
+        final_text: str,
+        tool_results: list[Any],
+        artifacts: list[Any],
+        evidence: list[Any],
+    ) -> list[str]:
+        """Run behavior-rules quality gates and return a list of error messages."""
+        gate_errors: list[str] = []
+        # Behavior gates are evaluated lazily to avoid heavy import overhead
+        # when the feature is disabled.
+        try:
+            from metis.behavior.registry import BehaviorRulesRegistry
+            from metis.behavior.builtin import build_behavior_rules_config
+
+            registry = BehaviorRulesRegistry(build_behavior_rules_config())
+            for gate_spec in registry.get_gate_specs():
+                try:
+                    result = gate_spec.handler({
+                        "session_id": session_id,
+                        "final_text": final_text,
+                        "tool_results": tool_results,
+                        "artifacts": artifacts,
+                        "evidence": evidence,
+                    })
+                    if not result.passed and gate_spec.failure_policy == "fail":
+                        gate_errors.append(f"[behavior gate: {result.name}] {result.message}")
+                    elif not result.passed:
+                        # warn policy — log but do not block
+                        logger.warning("Behavior gate '%s' warned: %s", result.name, result.message)
+                except Exception as exc:
+                    logger.warning("Behavior gate '%s' crashed: %s", gate_spec.name, exc)
+        except Exception as exc:
+            logger.debug("Behavior gates skipped: %s", exc)
+        return gate_errors
 
     @staticmethod
     def _turn_signature(response: NormalizedResponse) -> str:

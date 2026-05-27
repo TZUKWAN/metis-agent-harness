@@ -28,7 +28,9 @@ def test_web_app_exposes_rebrandable_config():
     assert payload["icon_text"] == "A"
 
 
-def test_web_app_exposes_runtime_status():
+def test_web_app_exposes_runtime_status(monkeypatch):
+    monkeypatch.setenv("METIS_API_KEY", "test-key")
+    monkeypatch.setenv("METIS_BASE_URL", "http://localhost:8000")
     manifest = AgentAppManifest(
         name="Acme Analyst",
         workspace=".",

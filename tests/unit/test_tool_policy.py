@@ -1,3 +1,5 @@
+import pytest
+
 from metis.runtime.response import ToolCall
 from metis.tools.dispatcher import ToolDispatcher
 from metis.tools.policy import CommandClassifier, ToolPolicyEngine
@@ -19,7 +21,8 @@ def test_command_classifier_requires_approval_for_external_publish():
     assert decision.risk_level == "external_publish"
 
 
-def test_dispatcher_blocks_dangerous_run_shell_before_handler():
+@pytest.mark.asyncio
+async def test_dispatcher_blocks_dangerous_run_shell_before_handler():
     called = False
 
     def handler(args, ctx):
@@ -31,7 +34,7 @@ def test_dispatcher_blocks_dangerous_run_shell_before_handler():
     registry.register(ToolSpec("run_shell", "Run", {"type": "object"}, handler, side_effect="write"))
     dispatcher = ToolDispatcher(registry, policy_engine=ToolPolicyEngine())
 
-    result = dispatcher.dispatch(ToolCall(name="run_shell", arguments={"command": "rm -rf ."}, id="c1"), ToolContext())
+    result = await dispatcher.dispatch(ToolCall(name="run_shell", arguments={"command": "rm -rf ."}, id="c1"), ToolContext())
 
     assert called is False
     assert result.status == "blocked"
@@ -41,19 +44,21 @@ def test_dispatcher_blocks_dangerous_run_shell_before_handler():
     assert result.metadata["retry_allowed"] is False
 
 
-def test_dispatcher_marks_allowed_policy_metadata():
+@pytest.mark.asyncio
+async def test_dispatcher_marks_allowed_policy_metadata():
     registry = ToolRegistry()
     registry.register(ToolSpec("read_file", "Read", {"type": "object"}, lambda args, ctx: {"ok": True}))
     dispatcher = ToolDispatcher(registry, policy_engine=ToolPolicyEngine())
 
-    result = dispatcher.dispatch(ToolCall(name="read_file", arguments={}, id="c1"), ToolContext())
+    result = await dispatcher.dispatch(ToolCall(name="read_file", arguments={}, id="c1"), ToolContext())
 
     assert result.status == "ok"
     assert result.metadata["policy_decision"] == "allow"
     assert result.metadata["risk_level"] == "safe_read"
 
 
-def test_dispatcher_marks_approval_required_repair_metadata():
+@pytest.mark.asyncio
+async def test_dispatcher_marks_approval_required_repair_metadata():
     called = False
 
     def handler(args, ctx):
@@ -65,7 +70,7 @@ def test_dispatcher_marks_approval_required_repair_metadata():
     registry.register(ToolSpec("run_shell", "Run", {"type": "object"}, handler, side_effect="write"))
     dispatcher = ToolDispatcher(registry, policy_engine=ToolPolicyEngine())
 
-    result = dispatcher.dispatch(
+    result = await dispatcher.dispatch(
         ToolCall(name="run_shell", arguments={"command": "git push origin main"}, id="c1"),
         ToolContext(),
     )

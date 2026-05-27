@@ -1,12 +1,15 @@
 import json
 
+import pytest
+
 from metis.adapters.sophia import SophiaAdapter
 from metis.runtime.response import ToolCall
 from metis.tools.dispatcher import ToolDispatcher
 from metis.tools.registry import ToolRegistry
 
 
-def test_sophia_adapter_registers_and_calls_inspection_tool(tmp_path):
+@pytest.mark.asyncio
+async def test_sophia_adapter_registers_and_calls_inspection_tool(tmp_path):
     project_root = tmp_path / "sophia-agent"
     project_root.mkdir()
     (project_root / "sophia").mkdir()
@@ -17,7 +20,7 @@ def test_sophia_adapter_registers_and_calls_inspection_tool(tmp_path):
     registry = ToolRegistry()
     registration = SophiaAdapter(project_root).register(registry)
 
-    result = ToolDispatcher(registry).dispatch(ToolCall(name="sophia_inspect_project", arguments={}))
+    result = await ToolDispatcher(registry).dispatch(ToolCall(name="sophia_inspect_project", arguments={}))
     payload = json.loads(result.content)
 
     assert registration.tools == ["sophia_inspect_project"]

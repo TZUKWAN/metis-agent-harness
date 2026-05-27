@@ -44,3 +44,10 @@ class TestTruncateForContext:
         ]
         result = AgentLoop._truncate_for_context(messages)
         assert len(result) == 1
+
+    def test_preserves_recent_proportion(self):
+        messages = [{"role": "user", "content": f"msg{i}"} for i in range(100)]
+        result = AgentLoop._truncate_for_context(messages)
+        non_system = [m for m in result if m.get("role") != "system"]
+        # Keeps at least half of non-system messages
+        assert len(non_system) >= 50

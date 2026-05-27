@@ -56,9 +56,17 @@ def _registry():
     return registry
 
 
+def _make_loop(**kwargs):
+    return AgentLoop(
+        provider=FakeProvider([{"content": "done"}]),
+        registry=_registry(),
+        profile="small",
+        **kwargs,
+    )
+
+
 @pytest.mark.asyncio
 async def test_circuit_breaker_blocks_after_threshold():
-    # 4 tool calls with different args to avoid loop detection, then done
     responses = [
         {"tool_calls": [{"name": "fail_tool", "arguments": {"value": f"v{i}"}, "id": f"c{i}"}]}
         for i in range(4)
@@ -75,25 +83,18 @@ async def test_circuit_breaker_blocks_after_threshold():
         messages=[{"role": "user", "content": "test"}],
         max_turns=10,
     ))
-    # At least one call should be circuit-broken after 3 failures
     cb_results = [r for r in result.tool_results if r.metadata.get("circuit_breaker")]
     assert len(cb_results) >= 1
 
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_resets_per_session():
-    loop = AgentLoop(
-        provider=FakeProvider([{"content": "done"}]),
-        registry=_registry(),
-        profile="small",
-    )
-    # Manually record failures for session-a
-    AgentLoop._record_tool_failure("session-a", "fail_tool")
-    AgentLoop._record_tool_failure("session-a", "fail_tool")
-    AgentLoop._record_tool_failure("session-a", "fail_tool")
+    loop = _make_loop()
+    loop._record_tool_failure("session-a", "fail_tool")
+    loop._record_tool_failure("session-a", "fail_tool")
+    loop._record_tool_failure("session-a", "fail_tool")
 
-    # session-b should not be affected
-    cb = AgentLoop._check_circuit_breaker("session-b", "fail_tool")
+    cb = loop._check_circuit_breaker("session-b", "fail_tool")
     assert cb is None
 
 
@@ -118,38 +119,36 @@ async def test_circuit_breaker_allows_success():
 
 
 def test_check_circuit_breaker_returns_none_under_threshold():
-    AgentLoop._SESSION_TOOL_FAILURES.clear()
-    assert AgentLoop._check_circuit_breaker("s1", "t1") is None
-    AgentLoop._record_tool_failure("s1", "t1")
-    AgentLoop._record_tool_failure("s1", "t1")
-    assert AgentLoop._check_circuit_breaker("s1", "t1") is None
+    loop = _make_loop()
+    assert loop._check_circuit_breaker("s1", "t1") is None
+    loop._record_tool_failure("s1", "t1")
+    loop._record_tool_failure("s1", "t1")
+    assert loop._check_circuit_breaker("s1", "t1") is None
 
 
 def test_check_circuit_breaker_returns_message_over_threshold():
-    AgentLoop._SESSION_TOOL_FAILURES.clear()
+    loop = _make_loop()
     now = time.monotonic()
-    # Inject 3 recent failures
-    AgentLoop._SESSION_TOOL_FAILURES["s2"] = {"t2": [now, now, now]}
-    msg = AgentLoop._check_circuit_breaker("s2", "t2")
+    loop._session_tool_failures["s2"] = {"t2": [now, now, now]}
+    msg = loop._check_circuit_breaker("s2", "t2")
     assert msg is not None
     assert "temporarily unavailable" in msg
 
 
 def test_record_tool_failure_prunes_stale_entries():
-    AgentLoop._SESSION_TOOL_FAILURES.clear()
+    loop = _make_loop()
     now = time.monotonic()
     old = now - AgentLoop._CIRCUIT_BREAKER_WINDOW - 1
-    AgentLoop._SESSION_TOOL_FAILURES["s3"] = {"t3": [old, now]}
-    AgentLoop._record_tool_failure("s3", "t3")
-    failures = AgentLoop._SESSION_TOOL_FAILURES["s3"]["t3"]
+    loop._session_tool_failures["s3"] = {"t3": [old, now]}
+    loop._record_tool_failure("s3", "t3")
+    failures = loop._session_tool_failures["s3"]["t3"]
     assert old not in failures
-    assert len(failures) == 2  # old pruned, now kept, new now appended
+    assert len(failures) == 2
 
 
 def test_circuit_breaker_cooldown_allows_recovery():
-    AgentLoop._SESSION_TOOL_FAILURES.clear()
+    loop = _make_loop()
     now = time.monotonic()
-    # Failures just at the boundary of cooldown
-    AgentLoop._SESSION_TOOL_FAILURES["s4"] = {"t4": [now - AgentLoop._CIRCUIT_BREAKER_COOLDOWN - 1] * 3}
-    msg = AgentLoop._check_circuit_breaker("s4", "t4")
+    loop._session_tool_failures["s4"] = {"t4": [now - AgentLoop._CIRCUIT_BREAKER_COOLDOWN - 1] * 3}
+    msg = loop._check_circuit_breaker("s4", "t4")
     assert msg is None

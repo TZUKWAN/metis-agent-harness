@@ -1,0 +1,9 @@
+{
+  "id": "weather-tool",
+  "name": "Weather Tool",
+  "version": "0.1.0",
+  "entrypoint": "plugin.py",
+  "description": "Provides a get_weather tool that queries wttr.in for current weather conditions.",
+  "tools": ["get_weather"],
+  "required_permissions": ["network"]
+}

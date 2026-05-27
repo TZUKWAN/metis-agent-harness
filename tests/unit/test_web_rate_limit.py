@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
@@ -16,36 +17,36 @@ def _clear_rate_limit_stores():
     _RATE_LIMIT_SESSION_STORE.clear()
 
 
-def test_rate_limit_allows_under_limit():
+async def test_rate_limit_allows_under_limit():
     for _ in range(RATE_LIMIT_MAX - 1):
-        _check_rate_limit("127.0.0.1")
+        await _check_rate_limit("127.0.0.1")
 
 
-def test_rate_limit_blocks_over_limit():
+async def test_rate_limit_blocks_over_limit():
     from fastapi import HTTPException
     for _ in range(RATE_LIMIT_MAX):
-        _check_rate_limit("10.0.0.1")
+        await _check_rate_limit("10.0.0.1")
     with pytest.raises(HTTPException) as exc:
-        _check_rate_limit("10.0.0.1")
+        await _check_rate_limit("10.0.0.1")
     assert exc.value.status_code == 429
 
 
-def test_rate_limit_different_ips_independent():
+async def test_rate_limit_different_ips_independent():
     for _ in range(RATE_LIMIT_MAX):
-        _check_rate_limit("ip_a")
-    _check_rate_limit("ip_b")
+        await _check_rate_limit("ip_a")
+    await _check_rate_limit("ip_b")
 
 
-def test_session_rate_limit_blocks_over_limit():
+async def test_session_rate_limit_blocks_over_limit():
     from fastapi import HTTPException
     for _ in range(10):
-        _check_session_rate_limit("sess_1")
+        await _check_session_rate_limit("sess_1")
     with pytest.raises(HTTPException) as exc:
-        _check_session_rate_limit("sess_1")
+        await _check_session_rate_limit("sess_1")
     assert exc.value.status_code == 429
 
 
-def test_session_rate_limit_different_sessions():
+async def test_session_rate_limit_different_sessions():
     for _ in range(10):
-        _check_session_rate_limit("sess_a")
-    _check_session_rate_limit("sess_b")
+        await _check_session_rate_limit("sess_a")
+    await _check_session_rate_limit("sess_b")

@@ -46,7 +46,9 @@ def test_manifest_allowed_tool_permissions_parses_csv():
     assert manifest_allowed_tool_permissions(manifest) == ["read_only", "workspace_write"]
 
 
-def test_build_runtime_status_exposes_manifest_provider_and_tools(tmp_path):
+def test_build_runtime_status_exposes_manifest_provider_and_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("METIS_API_KEY", "test-key")
+    monkeypatch.setenv("METIS_BASE_URL", "http://localhost:8000")
     manifest = AgentAppManifest(
         name="Agent",
         workspace=str(tmp_path),

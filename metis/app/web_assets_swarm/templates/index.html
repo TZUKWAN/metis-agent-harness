@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Metis Swarm Hub</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-icon">🐝</div>
+      <div>
+        <div class="brand-name">Metis Swarm</div>
+        <div class="brand-subtitle">Multi-Agent Hub</div>
+      </div>
+    </div>
+    <div class="sidebar-actions">
+      <button class="action-btn" id="scanBtn">🔍 Scan</button>
+      <button class="action-btn primary" id="createAgentBtn">+ Agent</button>
+      <button class="action-btn" id="createGroupBtn">+ Group</button>
+    </div>
+    <div class="sidebar-section">
+      <div class="section-title">Agents</div>
+      <div class="agent-list" id="agentList"></div>
+    </div>
+    <div class="sidebar-section">
+      <div class="section-title">Groups</div>
+      <div class="group-list" id="groupList"></div>
+    </div>
+    <div class="sidebar-section">
+      <div class="section-title trash-toggle" id="trashToggle">🗑 Trash</div>
+      <div class="trash-list hidden" id="trashList"></div>
+    </div>
+  </aside>
+  <main class="main" id="mainArea">
+    <div class="empty-state" id="emptyState">
+      <div class="empty-icon">🐝</div>
+      <h1>Metis Swarm Hub</h1>
+      <p>Select an agent or group from the sidebar to start collaborating.</p>
+    </div>
+    <div class="chat-area hidden" id="chatArea">
+      <header class="chat-header" id="chatHeader"></header>
+      <div class="messages" id="messages"></div>
+      <footer class="composer">
+        <div class="composer-inner">
+          <textarea id="messageInput" rows="1" placeholder="Send a message..."></textarea>
+          <button id="sendButton" disabled>➤</button>
+        </div>
+      </footer>
+    </div>
+  </main>
+</div>
+
+<!-- Create Agent Modal -->
+<div class="modal-overlay hidden" id="agentModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="agentModalTitle">Create Agent</h3>
+      <button class="modal-close" id="closeAgentModal">×</button>
+    </div>
+    <form class="modal-body" id="agentForm">
+      <div class="field">
+        <label>Name</label>
+        <input type="text" id="agentName" placeholder="My Agent" required>
+      </div>
+      <div class="field">
+        <label>Model</label>
+        <input type="text" id="agentModel" placeholder="gpt-4o" required>
+      </div>
+      <div class="field">
+        <label>Base URL</label>
+        <input type="text" id="agentBaseUrl" placeholder="https://api.openai.com/v1">
+      </div>
+      <div class="field">
+        <label>API Key</label>
+        <input type="password" id="agentApiKey" placeholder="sk-...">
+      </div>
+      <div class="field">
+        <label>Description</label>
+        <input type="text" id="agentDescription" placeholder="What does this agent do?">
+      </div>
+      <div class="field">
+        <label>Icon</label>
+        <input type="text" id="agentIcon" value="🤖" maxlength="4">
+      </div>
+      <div class="modal-actions">
+        <button type="submit" class="btn-primary">Save</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Create Group Modal -->
+<div class="modal-overlay hidden" id="groupModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>Create Group</h3>
+      <button class="modal-close" id="closeGroupModal">×</button>
+    </div>
+    <form class="modal-body" id="groupForm">
+      <div class="field">
+        <label>Name</label>
+        <input type="text" id="groupName" placeholder="Research Team" required>
+      </div>
+      <div class="field">
+        <label>Mode</label>
+        <select id="groupMode">
+          <option value="parallel">Parallel Discussion</option>
+          <option value="serial">Serial Relay</option>
+          <option value="coordinator">Coordinator</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Members</label>
+        <div class="checkbox-list" id="groupMembers"></div>
+      </div>
+      <div class="modal-actions">
+        <button type="submit" class="btn-primary">Create</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Edit Agent Modal -->
+<div class="modal-overlay hidden" id="editModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>Edit Agent</h3>
+      <button class="modal-close" id="closeEditModal">×</button>
+    </div>
+    <form class="modal-body" id="editForm">
+      <input type="hidden" id="editAgentId">
+      <div class="field">
+        <label>Name</label>
+        <input type="text" id="editName" required>
+      </div>
+      <div class="field">
+        <label>Model</label>
+        <input type="text" id="editModel" required>
+      </div>
+      <div class="field">
+        <label>Base URL</label>
+        <input type="text" id="editBaseUrl">
+      </div>
+      <div class="field">
+        <label>API Key <span class="hint">(leave empty to keep current)</span></label>
+        <input type="password" id="editApiKey" placeholder="••••••••">
+      </div>
+      <div class="field">
+        <label>System Prompt</label>
+        <textarea id="editSystemPrompt" rows="4"></textarea>
+      </div>
+      <div class="modal-actions">
+        <button type="submit" class="btn-primary">Save</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

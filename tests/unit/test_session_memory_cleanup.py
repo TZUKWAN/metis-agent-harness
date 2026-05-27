@@ -60,7 +60,6 @@ async def test_session_state_cleaned_on_exception():
 
 
 def test_prune_evicts_stale_sessions():
-    # Inject fake stale entries
     AgentLoop._SESSION_LAST_ACTIVITY["stale-1"] = time.monotonic() - 7200
     AgentLoop._SESSION_TOOL_COUNTS["stale-1"] = {"echo": 1}
     AgentLoop._SESSION_TOOL_FAILURES["stale-1"] = {"echo": [time.monotonic() - 7200]}
@@ -71,7 +70,6 @@ def test_prune_evicts_stale_sessions():
 
 
 def test_prune_evicts_oldest_when_over_limit():
-    # Temporarily lower limit for test
     original_limit = AgentLoop._MAX_TRACKED_SESSIONS
     AgentLoop._MAX_TRACKED_SESSIONS = 3
     try:
@@ -83,7 +81,6 @@ def test_prune_evicts_oldest_when_over_limit():
             AgentLoop._SESSION_TOOL_FAILURES[sid] = {}
         AgentLoop._prune_session_state()
         assert len(AgentLoop._SESSION_LAST_ACTIVITY) <= 3
-        # Oldest (overflow-4) should be evicted
         assert "overflow-4" not in AgentLoop._SESSION_LAST_ACTIVITY
     finally:
         AgentLoop._MAX_TRACKED_SESSIONS = original_limit

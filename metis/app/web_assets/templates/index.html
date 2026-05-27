@@ -5,10 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Metis Agent</title>
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/highlight.min.js"></script>
 </head>
 <body>
 <div class="app">
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="brand">
       <div class="brand-icon" id="brandIcon">M</div>
       <div>
@@ -16,32 +19,120 @@
         <div class="brand-subtitle" id="brandSubtitle">Agent Harness</div>
       </div>
     </div>
-    <button class="new-chat" id="newChat">+ New Chat</button>
+    <button class="new-chat" id="newChat">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      New Chat
+    </button>
     <div class="sessions" id="sessions"></div>
     <div class="sidebar-footer">
-      <div id="workspaceLabel">.</div>
-      <div id="modelLabel">model</div>
+      <div class="footer-row" id="workspaceLabel">.</div>
+      <div class="footer-row" id="modelLabel">model</div>
     </div>
   </aside>
   <main class="main">
     <header class="topbar">
-      <button class="icon-button" id="sidebarToggle" aria-label="Toggle sessions">Menu</button>
-      <span class="pill" id="profileLabel">small</span>
-      <span class="pill" id="statusLabel">Ready</span>
+      <button class="icon-button" id="sidebarToggle" aria-label="Toggle sidebar">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M3 5h12M3 9h12M3 13h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+      <div class="topbar-title" id="topbarTitle">Metis Agent</div>
+      <button class="icon-button hitl-bell" id="hitlBell" aria-label="Pending approvals" title="Pending approvals">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M9 2c3.5 0 6 2.5 6 6v3l1.5 1.5v.5H1.5v-.5L3 11V8c0-3.5 2.5-6 6-6z" stroke="currentColor" stroke-width="1.5"/><path d="M6.5 14.5c.5 1.5 1.5 2.5 2.5 2.5s2-1 2.5-2.5" stroke="currentColor" stroke-width="1.5"/></svg>
+        <span class="hitl-badge" id="hitlBadge">0</span>
+      </button>
+      <div class="hitl-panel hidden" id="hitlPanel">
+        <div class="hitl-panel-header">
+          <span>Pending Approvals</span>
+          <span class="hitl-history-link" id="hitlHistoryLink">History</span>
+        </div>
+        <div class="hitl-panel-list" id="hitlPanelList">
+          <div class="hitl-empty">No pending approvals</div>
+        </div>
+      </div>
+      <div class="hitl-history-overlay hidden" id="hitlHistoryOverlay">
+        <div class="hitl-history-modal">
+          <div class="hitl-history-header">
+            <span>Approval History</span>
+            <button class="icon-button" id="hitlHistoryClose" aria-label="Close">
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M1 1l12 12M13 1L1 13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+          <div class="hitl-history-list" id="hitlHistoryList">
+            <div class="hitl-empty">No approval history</div>
+          </div>
+        </div>
+      </div>
+      <button class="icon-button" id="settingsButton" aria-label="Settings" title="Settings">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><circle cx="9" cy="9" r="2.5" stroke="currentColor" stroke-width="1.5"/><path d="M14.5 9h-1.65a3.5 3.5 0 00-.35-1.35l1.17-1.17a6 6 0 00-1.06-1.06l-1.17 1.17A3.5 3.5 0 009 5.15V3.5h-.001v1.65a3.5 3.5 0 00-1.35.35L6.48 4.33a6 6 0 00-1.06 1.06l1.17 1.17A3.5 3.5 0 006.15 8H4.5v1h1.65a3.5 3.5 0 00.35 1.35l-1.17 1.17a6 6 0 001.06 1.06l1.17-1.17A3.5 3.5 0 009 12.85V14.5h1v-1.65a3.5 3.5 0 001.35-.35l1.17 1.17a6 6 0 001.06-1.06l-1.17-1.17A3.5 3.5 0 0012.85 10H14.5V9z" stroke="currentColor" stroke-width="1.5"/></svg>
+      </button>
+      <div class="topbar-pills">
+        <span class="pill" id="profileLabel">small</span>
+        <span class="pill" id="statusLabel">Ready</span>
+      </div>
     </header>
     <section class="messages" id="messages">
-      <div class="empty">
+      <div class="empty" id="emptyState">
         <div class="empty-icon" id="emptyIcon">M</div>
         <h1 id="emptyTitle">Metis Agent</h1>
         <p id="emptyDescription">Domain-neutral agent harness</p>
       </div>
     </section>
     <footer class="composer">
-      <textarea id="messageInput" rows="1" placeholder="Send a task to the agent..."></textarea>
-      <button id="sendButton" disabled aria-label="Send message">Send</button>
+      <div class="composer-inner">
+        <textarea id="messageInput" rows="1" placeholder="Send a task to the agent..."></textarea>
+        <button id="sendButton" disabled aria-label="Send message">
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M2 9l14-7-7 14V9H2z" fill="currentColor"/></svg>
+        </button>
+      </div>
     </footer>
   </main>
 </div>
+
+<!-- Setup Modal -->
+<div class="setup-overlay" id="setupOverlay" style="display:none;">
+  <div class="setup-modal">
+    <div class="setup-header">
+      <div class="setup-icon">M</div>
+      <h2>Welcome to Metis Agent</h2>
+      <p>Configure your AI provider to get started.</p>
+    </div>
+    <form class="setup-form" id="setupForm">
+      <div class="setup-field">
+        <label for="setupModel">Model</label>
+        <input type="text" id="setupModel" placeholder="e.g. gpt-4o, claude-3-5-sonnet, deepseek-chat..." required>
+      </div>
+      <div class="setup-field">
+        <label for="setupBaseUrl">Base URL <span class="setup-optional">(optional)</span></label>
+        <input type="text" id="setupBaseUrl" placeholder="https://api.openai.com/v1">
+        <div class="setup-hint">Leave empty for provider defaults.</div>
+      </div>
+      <div class="setup-field">
+        <label for="setupApiKey">API Key</label>
+        <input type="password" id="setupApiKey" placeholder="sk-..." required>
+        <div class="setup-hint">Your key is stored locally in metis-agent.json.</div>
+      </div>
+      <div class="setup-field">
+        <label for="setupProfile">Profile</label>
+        <select id="setupProfile">
+          <option value="small">Small (fast, concise)</option>
+          <option value="medium">Medium (balanced)</option>
+          <option value="large">Large (thorough, detailed)</option>
+        </select>
+      </div>
+      <div class="setup-field">
+        <label>
+          <input type="checkbox" id="setupHitlEnabled" style="margin-right: 8px;">
+          Enable HITL approval for destructive operations
+        </label>
+        <div class="setup-hint">When enabled, write/delete/network tools require manual approval.</div>
+      </div>
+      <div class="setup-actions">
+        <button type="submit" class="setup-submit" id="setupSubmit">Save &amp; Continue</button>
+      </div>
+      <div class="setup-error" id="setupError"></div>
+    </form>
+  </div>
+</div>
+
 <script src="/static/app.js"></script>
 </body>
 </html>

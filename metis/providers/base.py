@@ -6,7 +6,9 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from metis.runtime.response import NormalizedResponse
+from collections.abc import AsyncIterator
+
+from metis.runtime.response import NormalizedResponse, StreamChunk
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,19 @@ class BaseProvider(ABC):
         **params: Any,
     ) -> NormalizedResponse:
         """Return a normalized completion response."""
+
+    async def complete_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        **params: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """Yield normalized completion chunks for streaming responses.
+
+        Subclasses that support streaming must override this method.
+        The default raises NotImplementedError.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support streaming")
 
     async def health_check(self) -> dict[str, Any]:
         """Lightweight check that the provider endpoint is reachable."""

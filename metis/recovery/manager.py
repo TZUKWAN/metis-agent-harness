@@ -37,7 +37,7 @@ class RecoveryManager:
                 if not self.retry_policy.should_retry(category, attempt):
                     raise
                 delay = self.retry_policy.delay_for(attempt)
-                self.hooks.emit("recovery.retry", {"attempt": attempt + 1, "category": category, "delay": delay})
+                await self.hooks.emit_async("recovery.retry", {"attempt": attempt + 1, "category": category, "delay": delay})
                 await asyncio.sleep(delay)
                 attempt += 1
 

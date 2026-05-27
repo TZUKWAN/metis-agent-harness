@@ -1,0 +1,35 @@
+{
+  "name": "Test",
+  "subtitle": "Agent Harness",
+  "description": "Domain-neutral agent harness",
+  "version": "0.2.0",
+  "workspace": ".",
+  "model": "gpt-4o",
+  "base_url": "https://custom.api.com/v1",
+  "profile": "small",
+  "icon_text": "M",
+  "system_prompt_path": "",
+  "developer_prompt_path": "",
+  "allowed_tool_permissions": "",
+  "state_db_path": "",
+  "mcp_servers": [],
+  "providers": [
+    {
+      "name": "gpt-4o",
+      "model": "gpt-4o",
+      "provider_type": "openai_compat",
+      "priority": 0,
+      "base_url": "https://custom.api.com/v1",
+      "api_key": "sk-test123"
+    }
+  ],
+  "fallback_providers": [],
+  "routing_strategy": "primary_fallback",
+  "provider_health_check_interval": 60.0,
+  "provider_failover_enabled": true,
+  "hitl_enabled": false,
+  "hitl_auto_approve_read_only": true,
+  "hitl_auto_approve_tools": "",
+  "hitl_auto_deny_tools": "",
+  "hitl_timeout_seconds": 300.0
+}

@@ -1,12 +1,15 @@
 import json
 
+import pytest
+
 from metis.adapters.aurora import AuroraAdapter
 from metis.runtime.response import ToolCall
 from metis.tools.dispatcher import ToolDispatcher
 from metis.tools.registry import ToolRegistry
 
 
-def test_aurora_adapter_registers_and_calls_inspection_tool(tmp_path):
+@pytest.mark.asyncio
+async def test_aurora_adapter_registers_and_calls_inspection_tool(tmp_path):
     project_root = tmp_path / "aurora-agent"
     project_root.mkdir()
     (project_root / "aurora").mkdir()
@@ -17,7 +20,7 @@ def test_aurora_adapter_registers_and_calls_inspection_tool(tmp_path):
     registry = ToolRegistry()
     registration = AuroraAdapter(project_root).register(registry)
 
-    result = ToolDispatcher(registry).dispatch(ToolCall(name="aurora_inspect_project", arguments={}))
+    result = await ToolDispatcher(registry).dispatch(ToolCall(name="aurora_inspect_project", arguments={}))
     payload = json.loads(result.content)
 
     assert registration.tools == ["aurora_inspect_project"]

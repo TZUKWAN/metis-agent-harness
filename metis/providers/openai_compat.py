@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
 from typing import Any
@@ -16,7 +17,9 @@ from metis.providers.parsers.openai_native import OpenAINativeParser
 from metis.providers.parsers.repair import ParserChain
 from metis.providers.response_cache import ResponseCache
 from metis.runtime.errors import ProviderError
-from metis.runtime.response import NormalizedResponse
+from collections.abc import AsyncIterator
+
+from metis.runtime.response import NormalizedResponse, StreamChunk
 
 logger = get_logger("provider")
 
@@ -42,6 +45,10 @@ class OpenAICompatibleProvider(BaseProvider):
             if retry_backoff_seconds is not None
             else _env_float("METIS_PROVIDER_RETRY_BACKOFF_SECONDS", 2.0)
         )
+        if not self.base_url:
+            raise ProviderError("Provider base_url is required. Set METIS_BASE_URL or pass base_url=")
+        if not self.api_key:
+            raise ProviderError("Provider api_key is required. Set METIS_API_KEY or pass api_key=")
         self.native_parser = OpenAINativeParser()
         self.text_parser = ParserChain()
         self._client: httpx.AsyncClient | None = None
@@ -84,16 +91,20 @@ class OpenAICompatibleProvider(BaseProvider):
         await self.close()
 
     _MODEL_CAPABILITIES: dict[str, dict[str, Any]] = {
-        "glm-4.9": {"thinking": True, "max_context_tokens": 256_000, "max_output_tokens": 16_384},
-        "glm-4.7": {"thinking": True, "max_context_tokens": 128_000, "max_output_tokens": 8_192},
-        "glm-4.5": {"thinking": True, "max_context_tokens": 128_000, "max_output_tokens": 8_192},
-        "glm-4": {"thinking": False, "max_context_tokens": 128_000, "max_output_tokens": 4_096},
-        "gpt-4o-mini": {"thinking": False, "max_context_tokens": 128_000, "max_output_tokens": 16_384},
-        "gpt-4o": {"thinking": False, "max_context_tokens": 128_000, "max_output_tokens": 16_384},
-        "gpt-4": {"thinking": False, "max_context_tokens": 128_000, "max_output_tokens": 8_192},
-        "claude-3-5-sonnet": {"thinking": False, "max_context_tokens": 200_000, "max_output_tokens": 8_192},
-        "claude-3-5-haiku": {"thinking": False, "max_context_tokens": 200_000, "max_output_tokens": 4_096},
+        "glm-4.9": {"thinking": True, "streaming": True, "max_context_tokens": 256_000, "max_output_tokens": 16_384},
+        "glm-4.7": {"thinking": True, "streaming": True, "max_context_tokens": 128_000, "max_output_tokens": 8_192},
+        "glm-4.5": {"thinking": True, "streaming": True, "max_context_tokens": 128_000, "max_output_tokens": 8_192},
+        "glm-4": {"thinking": False, "streaming": True, "max_context_tokens": 128_000, "max_output_tokens": 4_096},
+        "gpt-4o-mini": {"thinking": False, "streaming": True, "max_context_tokens": 128_000, "max_output_tokens": 16_384},
+        "gpt-4o": {"thinking": False, "streaming": True, "max_context_tokens": 128_000, "max_output_tokens": 16_384},
+        "gpt-4": {"thinking": False, "streaming": True, "max_context_tokens": 128_000, "max_output_tokens": 8_192},
+        "claude-3-5-sonnet": {"thinking": False, "streaming": True, "max_context_tokens": 200_000, "max_output_tokens": 8_192},
+        "claude-3-5-haiku": {"thinking": False, "streaming": True, "max_context_tokens": 200_000, "max_output_tokens": 4_096},
     }
+
+    @classmethod
+    def register_model_capabilities(cls, prefix: str, caps: dict[str, Any]) -> None:
+        cls._MODEL_CAPABILITIES[prefix] = caps
 
     def capabilities(self) -> ProviderCapabilities:
         model_lower = self.model.lower()
@@ -158,6 +169,118 @@ class OpenAICompatibleProvider(BaseProvider):
         if self._response_cache is not None:
             self._response_cache.put(messages, tools, data)
         return self._parse_response(data)
+
+    async def complete_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        **params: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        if not self.base_url or not self.api_key:
+            raise ProviderError("METIS_BASE_URL and METIS_API_KEY are required")
+
+        payload: dict[str, Any] = {
+            "model": params.pop("model", self.model),
+            "messages": messages,
+            "temperature": params.pop("temperature", DEFAULT_TEMPERATURE),
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = params.pop("tool_choice", "auto")
+        payload.update(params)
+
+        env_max = os.getenv("METIS_PROVIDER_MAX_TOKENS")
+        if env_max:
+            payload["max_tokens"] = int(env_max)
+        elif "max_tokens" not in payload:
+            caps = self.capabilities()
+            if caps.max_output_tokens > 0:
+                payload["max_tokens"] = caps.max_output_tokens
+
+        url = f"{self.base_url}/chat/completions"
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+
+        client = self._get_client()
+        accumulated_content = ""
+        accumulated_reasoning: str | None = None
+        accumulated_tool_calls: list[dict[str, Any]] = []
+        finish_reason = ""
+        usage: dict[str, Any] = {}
+
+        try:
+            async with client.stream("POST", url, headers=headers, json=payload, timeout=self.timeout) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[len("data: "):].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk_data = json.loads(data_str)
+                    except Exception:
+                        continue
+                    choices = chunk_data.get("choices", [{}])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    delta_content = delta.get("content") or ""
+                    delta_reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                    delta_tool_calls = delta.get("tool_calls") or []
+                    chunk_finish = choices[0].get("finish_reason") or ""
+
+                    if delta_content:
+                        accumulated_content += delta_content
+                    if delta_reasoning:
+                        if accumulated_reasoning is None:
+                            accumulated_reasoning = ""
+                        accumulated_reasoning += delta_reasoning
+                    if delta_tool_calls:
+                        for tc in delta_tool_calls:
+                            index = tc.get("index", 0)
+                            while len(accumulated_tool_calls) <= index:
+                                accumulated_tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                            existing = accumulated_tool_calls[index]
+                            if tc.get("id"):
+                                existing["id"] = tc["id"]
+                            if tc.get("type"):
+                                existing["type"] = tc["type"]
+                            func = tc.get("function", {})
+                            if func.get("name"):
+                                existing["function"]["name"] += func["name"]
+                            if func.get("arguments"):
+                                existing["function"]["arguments"] += func["arguments"]
+
+                    if chunk_finish:
+                        finish_reason = chunk_finish
+
+                    chunk_usage = chunk_data.get("usage")
+                    if chunk_usage:
+                        usage = chunk_usage
+
+                    yield StreamChunk(
+                        content=delta_content,
+                        reasoning=delta_reasoning,
+                        tool_calls=None,
+                        is_finished=False,
+                        usage=usage if chunk_usage else {},
+                    )
+        except Exception as exc:
+            raise ProviderError(f"Streaming request failed: {exc}") from exc
+
+        # Final chunk with accumulated data
+        parsed_tool_calls = self.native_parser.parse(accumulated_tool_calls) if accumulated_tool_calls else []
+        yield StreamChunk(
+            content=accumulated_content,
+            reasoning=accumulated_reasoning,
+            tool_calls=parsed_tool_calls if parsed_tool_calls else None,
+            is_finished=True,
+            usage=usage,
+        )
 
     def _parse_response(self, data: dict[str, Any]) -> NormalizedResponse:
         choice = data.get("choices", [{}])[0]

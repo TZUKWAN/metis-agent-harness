@@ -29,6 +29,10 @@ class TaskContractV1:
     completion_definition: str = "The task is complete only when requested deliverables are produced and verified with evidence."
     source: str = "runtime_intake"
     version: str = "task-contract-v1"
+    testing_required: bool = True
+    audit_required: bool = True
+    research_required: bool = False
+    subtasks: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -46,6 +50,9 @@ class TaskContractV1:
             f"Objective: {self.objective}",
             f"Scope: {self.scope}",
             f"Approval required: {str(self.approval_required).lower()}",
+            f"Testing required: {str(self.testing_required).lower()}",
+            f"Audit required: {str(self.audit_required).lower()}",
+            f"Research required: {str(self.research_required).lower()}",
             "",
             "Deliverables:",
             *self._bullets(self.deliverables),
@@ -105,20 +112,27 @@ def build_intake_task_contract(
             "The response directly addresses the requested objective.",
             "Any claim of completion is backed by evidence from files, tool results, commands, or artifacts.",
             "Known missing work, unverified assumptions, and residual risks are reported truthfully.",
+            "Testing and verification are part of the default task scope unless explicitly excluded.",
+            "All sub-tasks have been addressed with concrete evidence.",
         ],
         allowed_tools=list(allowed_tools or []),
         forbidden_actions=[
             "Do not fabricate command output, files, uploads, API calls, tests, or external research.",
             "Do not modify files outside the active workspace unless explicitly approved.",
+            "Do not claim completion without concrete evidence.",
+            "Do not use placeholder text, mock data, or simulated results.",
         ],
         evidence_requirements=[
             "Use concrete tool results, file paths, command outputs, artifacts, or trace events for completion claims.",
             "For tests, record the exact command and result.",
             "For generated files, ensure the file exists at the reported path.",
+            "If external research is needed, record search queries and sources.",
         ],
         artifact_requirements=["Artifacts must use portable workspace-relative paths when possible."],
         verification_commands=[],
         source=source,
+        testing_required=True,
+        audit_required=True,
     )
 
 

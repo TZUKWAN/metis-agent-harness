@@ -6,7 +6,8 @@ from metis.providers.fake import FakeProvider
 from metis.state.sqlite_store import SQLiteStateStore
 
 
-def test_cli_provider_capabilities_prints_json(capsys):
+def test_cli_provider_capabilities_prints_json(monkeypatch, capsys):
+    monkeypatch.setenv("METIS_API_KEY", "test-key")
     exit_code = cli.main(
         [
             "provider",
@@ -86,7 +87,7 @@ def test_cli_resume_continues_persisted_session(monkeypatch, tmp_path, capsys):
     store.append_message("s1", "user", "original task")
     monkeypatch.setattr(
         cli,
-        "OpenAICompatibleProvider",
+        "build_provider",
         lambda **kwargs: FakeProvider(
             [
                 {
@@ -136,7 +137,7 @@ def test_cli_run_can_persist_state_when_state_db_is_enabled(monkeypatch, tmp_pat
     state_db = tmp_path / "run-state.db"
     monkeypatch.setattr(
         cli,
-        "OpenAICompatibleProvider",
+        "build_provider",
         lambda **kwargs: FakeProvider(
             [
                 {

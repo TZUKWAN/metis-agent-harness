@@ -7,7 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Any
 
-from metis.config import TOOL_EXECUTION_TIMEOUT
+from metis.config import TOOL_DISPATCHER_WORKERS, TOOL_EXECUTION_TIMEOUT
 from metis.events.event_types import EventType
 from metis.events.hooks import HookBus
 from metis.runtime.response import ToolCall, ToolResult
@@ -23,7 +23,7 @@ from metis.tools.coerce import coerce_arguments
 from metis.tools.sanitizer import ToolInputSanitizer
 from metis.tools.spec import ToolContext
 
-_executor = ThreadPoolExecutor(max_workers=4)
+_default_executor = ThreadPoolExecutor(max_workers=TOOL_DISPATCHER_WORKERS)
 
 
 class ToolDispatcher:
@@ -35,6 +35,7 @@ class ToolDispatcher:
         guardrails: ToolCallGuardrailController | None = None,
         policy_engine: ToolPolicyEngine | None = None,
         schema_validator: ToolArgumentSchemaValidator | None = None,
+        executor: ThreadPoolExecutor | None = None,
     ) -> None:
         self.registry = registry
         self.hooks = hooks or HookBus()
@@ -44,8 +45,9 @@ class ToolDispatcher:
         self.schema_validator = schema_validator or ToolArgumentSchemaValidator()
         self.sanitizer = ToolInputSanitizer()
         self.analytics = ToolAnalytics()
+        self._executor = executor or _default_executor
 
-    def dispatch(self, call: ToolCall, context: ToolContext | None = None) -> ToolResult:
+    async def dispatch(self, call: ToolCall, context: ToolContext | None = None) -> ToolResult:
         context = context or ToolContext()
         start = time.monotonic()
         context.hooks = context.hooks or self.hooks
@@ -71,7 +73,7 @@ class ToolDispatcher:
         policy_decision = self.policy_engine.before_dispatch(call, spec, context)
         if not policy_decision.allowed:
             error = policy_decision.reason or f"Tool policy denied call: {call.name}"
-            self.hooks.emit(
+            await self.hooks.emit_async(
                 EventType.TOOL_GUARDRAIL_BLOCK,
                 {
                     "tool": call.name,
@@ -98,7 +100,7 @@ class ToolDispatcher:
         if self.guardrails is not None:
             decision = self.guardrails.before_call(call, spec)
             if decision.blocked:
-                self.hooks.emit(
+                await self.hooks.emit_async(
                     EventType.TOOL_GUARDRAIL_BLOCK,
                     {"tool": call.name, "tool_call_id": call.id, "message": decision.message},
                 )
@@ -118,7 +120,7 @@ class ToolDispatcher:
         if not schema_result.passed:
             error = "Tool argument schema validation failed: " + "; ".join(schema_result.errors)
             schema_feedback = schema_repair_feedback(schema_result.errors)
-            self.hooks.emit(
+            await self.hooks.emit_async(
                 EventType.TOOL_GUARDRAIL_BLOCK,
                 {
                     "tool": call.name,
@@ -145,9 +147,9 @@ class ToolDispatcher:
                 },
             )
 
-        pre_ctx = self.hooks.emit(
+        pre_ctx = await self.hooks.emit_async(
             EventType.TOOL_PRE_DISPATCH,
-            {"tool": call.name, "args": call.arguments, "tool_call_id": call.id},
+            {"tool": call.name, "args": call.arguments, "tool_call_id": call.id, "spec": spec},
         )
         if pre_ctx.get("blocked"):
             reason = str(pre_ctx.get("block_reason", "Blocked by hook"))
@@ -161,7 +163,7 @@ class ToolDispatcher:
             )
 
         try:
-            future = _executor.submit(spec.handler, call.arguments, context)
+            future = self._executor.submit(spec.handler, call.arguments, context)
             effective_timeout = spec.timeout_seconds or TOOL_EXECUTION_TIMEOUT
             try:
                 raw_result = future.result(timeout=effective_timeout)
@@ -209,7 +211,7 @@ class ToolDispatcher:
                     }
                 )
                 if persisted.persisted:
-                    self.hooks.emit(
+                    await self.hooks.emit_async(
                         EventType.TOOL_RESULT_PERSISTED,
                         {
                             "tool": call.name,
@@ -224,14 +226,15 @@ class ToolDispatcher:
             result = ToolResult(call.name, content, status=status, tool_call_id=call.id, error=error_text, metadata=metadata)
             if self.guardrails is not None:
                 self.guardrails.after_call(call, spec, result)
-            self.hooks.emit(
+            await self.hooks.emit_async(
                 EventType.TOOL_POST_DISPATCH,
-                {"tool": call.name, "args": call.arguments, "result": content, "tool_call_id": call.id},
+                {"tool": call.name, "args": call.arguments, "result": content, "tool_call_id": call.id, "status": status, "error": error_text},
             )
-            self.hooks.emit(
+            await self.hooks.emit_async(
                 "tool.analytics",
                 {
                     "tool": call.name,
+                    "tool_call_id": call.id,
                     "category": spec.category,
                     "side_effect": spec.side_effect,
                     "status": status,
@@ -259,7 +262,7 @@ class ToolDispatcher:
             )
             if self.guardrails is not None:
                 self.guardrails.after_call(call, spec, result)
-            self.hooks.emit(
+            await self.hooks.emit_async(
                 EventType.TOOL_ERROR,
                 {"tool": call.name, "args": call.arguments, "error": str(exc), "error_type": type(exc).__name__},
             )

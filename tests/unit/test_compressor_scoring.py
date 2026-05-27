@@ -11,6 +11,11 @@ def test_system_always_highest_score():
     assert SimpleContextCompressor._score_message({"role": "system", "content": "rules"}, 0, 5) == 100
 
 
+def test_protected_system_absolute_score():
+    msg = {"role": "system", "content": "[base-harness] harness"}
+    assert SimpleContextCompressor._score_message(msg, 0, 5) == 1000
+
+
 def test_user_high_score():
     assert SimpleContextCompressor._score_message({"role": "user", "content": "hi"}, 0, 5) == 80
 
@@ -34,14 +39,14 @@ def test_recent_tool_higher_than_old():
 
 def test_force_fit_preserves_system_and_high_priority():
     compressor = SimpleContextCompressor()
-    messages = [
-        {"role": "system", "content": "SYS"},
+    system_msgs = [{"role": "system", "content": "SYS"}]
+    evictable = [
         {"role": "user", "content": "USER"},
         {"role": "tool", "content": json.dumps({"error": "fail"}), "name": "run"},
         {"role": "assistant", "content": "A" * 200},
         {"role": "tool", "content": json.dumps({"result": "ok"}), "name": "read"},
     ]
-    result = compressor._force_fit(messages, 50)
+    result = compressor._force_fit_with_protection(evictable, system_msgs, 50)
     roles = [m["role"] for m in result]
     assert "system" in roles
     assert "user" in roles
@@ -53,16 +58,12 @@ def test_force_fit_preserves_system_and_high_priority():
 
 def test_force_fit_drops_lowest_score_first():
     compressor = SimpleContextCompressor()
-    messages = [
-        {"role": "system", "content": "S"},
+    system_msgs = [{"role": "system", "content": "S"}]
+    evictable = [
         {"role": "assistant", "content": "A" * 100},
         {"role": "tool", "content": json.dumps({"result": "x"}), "name": "read"},
     ]
-    result = compressor._force_fit(messages, 10)
+    result = compressor._force_fit_with_protection(evictable, system_msgs, 10)
     roles = [m["role"] for m in result]
     assert "system" in roles
-    # assistant (score 50) should be dropped before tool (score 40, but actually old tool is 40)
-    # Wait, assistant is 50, old tool is 40. Tool has lower score. Let me check...
-    # Actually assistant=50 > old_tool=40, so tool should be dropped first.
-    # But the result should still have system.
     assert result[0]["role"] == "system"

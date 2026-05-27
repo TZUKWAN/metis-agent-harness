@@ -18,7 +18,7 @@ def test_openai_compat_provider_reports_configured_capabilities(monkeypatch):
     assert capabilities["native_tool_calling"] is True
     assert capabilities["json_schema_output"] is True
     assert capabilities["thinking"] is True
-    assert capabilities["streaming"] is False
+    assert capabilities["streaming"] is True
     assert capabilities["max_context_tokens"] == 131072
     assert capabilities["max_output_tokens"] == 65536
     assert capabilities["retryable_status_codes"] == [429, 500, 502, 503, 504]

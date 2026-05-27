@@ -33,3 +33,7 @@ class CompletionClaim(StrEnum):
 
 
 SOURCE_TYPES = {item.value for item in EvidenceSourceType}
+
+
+def register_source_type(name: str) -> None:
+    SOURCE_TYPES.add(name)

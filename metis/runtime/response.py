@@ -41,6 +41,15 @@ class NormalizedResponse:
 
 
 @dataclass
+class StreamChunk:
+    content: str = ""
+    reasoning: str | None = None
+    tool_calls: list[ToolCall] | None = None
+    is_finished: bool = False
+    usage: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class AgentRunRequest:
     messages: list[dict[str, Any]]
     max_turns: int = DEFAULT_MAX_TURNS

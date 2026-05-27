@@ -31,6 +31,14 @@ COMPRESS_PREVIEW_CHARS = 300
 
 STATE_DB_FILENAME = "state.db"
 TOOL_RESULTS_DIR = ".metis/tool-results"
+TOOL_DISPATCHER_WORKERS = int(os.getenv("METIS_TOOL_DISPATCHER_WORKERS", "4"))
+MAX_SAME_TOOL_PER_SESSION = int(os.getenv("METIS_MAX_SAME_TOOL_PER_SESSION", "20"))
+
+TEMP_BASE = float(os.getenv("METIS_TEMP_BASE", "0.2"))
+TEMP_PER_TURN = float(os.getenv("METIS_TEMP_PER_TURN", "0.05"))
+TEMP_REPAIR_BOOST = float(os.getenv("METIS_TEMP_REPAIR_BOOST", "0.1"))
+TEMP_LOOP_BOOST = float(os.getenv("METIS_TEMP_LOOP_BOOST", "0.15"))
+TEMP_MAX = float(os.getenv("METIS_TEMP_MAX", "0.8"))
 
 
 def validate_config() -> list[str]:

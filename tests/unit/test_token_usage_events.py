@@ -18,6 +18,10 @@ class FakeProvider:
         self.responses = list(responses)
         self._index = 0
 
+    def capabilities(self):
+        from metis.providers.base import ProviderCapabilities
+        return ProviderCapabilities(provider_type="fake", model="fake")
+
     async def complete(self, messages, tools=None, **params):
         resp = self.responses[self._index]
         self._index += 1

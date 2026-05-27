@@ -1,0 +1,8 @@
+{
+  "id": "prompt-fragment",
+  "name": "Chinese Prompt Fragment",
+  "version": "0.1.0",
+  "entrypoint": "plugin.py",
+  "description": "Injects a prompt fragment requiring the agent to always respond in Chinese.",
+  "prompt_fragments": ["respond_in_chinese"]
+}

@@ -1,0 +1,8 @@
+{
+  "id": "custom-gate",
+  "name": "Custom Quality Gate",
+  "version": "0.1.0",
+  "entrypoint": "plugin.py",
+  "description": "Registers a quality gate that rejects artifacts containing hardcoded absolute paths.",
+  "eval_suites": ["no_hardcoded_paths"]
+}

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from metis.events.event_types import EventType
 from metis.events.hooks import HookBus
 from metis.runtime.budgets import BudgetConfig
@@ -10,7 +12,8 @@ from metis.tools.result_store import PERSISTED_OUTPUT_TAG, ToolResultStore
 from metis.tools.spec import ToolSpec
 
 
-def test_dispatcher_persists_large_tool_result(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_dispatcher_persists_large_tool_result(tmp_path: Path):
     registry = ToolRegistry()
     registry.register(ToolSpec("large", "Large", {"type": "object"}, lambda args, ctx: "x" * 30))
     hooks = HookBus()
@@ -22,7 +25,7 @@ def test_dispatcher_persists_large_tool_result(tmp_path: Path):
         ToolResultStore(tmp_path, BudgetConfig(per_tool_chars=10, preview_chars=5)),
     )
 
-    result = dispatcher.dispatch(ToolCall(name="large", arguments={}, id="c1"))
+    result = await dispatcher.dispatch(ToolCall(name="large", arguments={}, id="c1"))
 
     assert result.status == "ok"
     assert result.metadata["persisted"] is True

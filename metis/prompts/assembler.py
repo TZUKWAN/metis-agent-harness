@@ -121,6 +121,7 @@ class PromptAssembler:
         app_system_prompt: str = "",
         app_developer_prompt: str = "",
         task_contract_v1: TaskContractV1 | None = None,
+        behavior_rules_prompt: str = "",
     ) -> PromptStack:
         identity = SMALL_MODEL_IDENTITY if parts.strict_output_soft else parts.base_identity
         layers = [
@@ -142,6 +143,16 @@ class PromptAssembler:
             )
         elif parts.task_contract:
             layers.append(PromptLayer("task-contract", parts.task_contract, "legacy-prompt-parts"))
+        if behavior_rules_prompt:
+            layers.append(
+                PromptLayer(
+                    "behavior-rules",
+                    behavior_rules_prompt,
+                    "metis.behavior.registry",
+                    version="v1",
+                    metadata={},
+                )
+            )
         for layer in [
             PromptLayer("memory-context", self._fence("memory-context", parts.memory_context), "context.memory"),
             PromptLayer("workspace-context", self._fence("workspace-context", parts.workspace_context), "context.workspace"),
